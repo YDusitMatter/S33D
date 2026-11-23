@@ -1,0 +1,10 @@
+# Prefer S33D Settings > Agent Control > Codex > Register / Update.
+# For manual setup, replace <ABSOLUTE_PATH_TO_S33D_AGENT> with the full path to
+# this computer's s33d-agent executable. Keep the absolute path so Codex can
+# start the bridge from any project working directory.
+# Windows: codex mcp add s33d -- "<S33D_INSTALL_DIR>\s33d-agent.exe" mcp
+# macOS/Linux: codex mcp add s33d -- "<S33D_INSTALL_DIR>/s33d-agent" mcp
+
+[mcp_servers.s33d]
+command = '<ABSOLUTE_PATH_TO_S33D_AGENT>'
+args = ["mcp"]

@@ -1,0 +1,85 @@
+# Rust build output and test artifacts
+/target/
+*.profraw
+*.profdata
+/coverage/
+/lcov.info
+
+# S33D runtime state and diagnostics
+/ui_state.json
+/debug/
+*.log
+*.trace
+
+# Local checkpoints and generated archives
+/backups/
+/work/
+/tmp/
+/output/
+
+# Internal AI appearance mockups; retain locally, never use as production icons.
+# The project-authored vector icon contact sheet remains available for review.
+/output/ui-concepts/2026-10-30/A-precision-classic.png
+/output/ui-concepts/2026-10-30/B-graphite-studio.png
+/output/ui-concepts/2026-10-30/C-porcelain-workshop.png
+
+# Internal agent/reasoning workspaces and configuration
+/.reasonix/
+/reasonix.toml
+/.agents/
+/.codex/
+/.mcp.json
+
+# Internal work logs, task routing, and private planning notes
+/Logs/
+/Docs/Logs/
+# Private, disposable UI acceptance data and build/test transcripts for this task
+/work/kaigong-ui/
+/Docs/Task.md
+/Docs/kaigong.md
+/Docs/xiaban.md
+/Docs/Routine.md
+/Docs/Template_Task.md
+/Docs/Template_ProjectState.md
+/Docs/ProjectState.md
+/Docs/08-30-2026_2334_OpenSource-Business-Discussion.md
+/Docs/S33D Goals V1.txt
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.pdb
+*.dmp
+
+# Internal review and local tool setup; not public release documentation.
+/packaging/IMAGEGEN-API.md
+/Docs/*Audit*.md
+/Docs/*Proposal*.md
+/Docs/SketchRegionRenderingReview-*.md
+/Docs/PerformanceVerification-*.md
+
+# Editors and operating systems
+/.idea/
+/.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary and patch files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~

@@ -1,0 +1,8 @@
+{
+  "id": "tire-generator",
+  "name": "Tire Generator",
+  "version": "1.0.0",
+  "entry": "builtin:tire-generator",
+  "defaultEnabled": false,
+  "description": "Generate editable dimensioned tires with common road and off-road tread patterns."
+}

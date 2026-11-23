@@ -1,0 +1,8 @@
+{
+  "id": "gear-generator",
+  "name": "Gear Generator",
+  "version": "1.0.0",
+  "entry": "builtin:gear-generator",
+  "defaultEnabled": false,
+  "description": "Generate editable spur, helical, bevel, and internal gears from standard gear parameters."
+}

@@ -1,0 +1,8 @@
+{
+  "id": "screw-generator",
+  "name": "Screw Generator",
+  "version": "1.0.0",
+  "entry": "builtin:screw-generator",
+  "defaultEnabled": false,
+  "description": "Editable hex, socket, countersunk and thumb screws and studs, with modeled threads and print clearance."
+}

@@ -1,0 +1,8 @@
+{
+  "id": "surface-texture",
+  "name": "Surface Texture",
+  "version": "1.0.0",
+  "entry": "builtin:surface-texture",
+  "defaultEnabled": false,
+  "description": "Generate editable straight, diagonal, and diamond knurling on planar or cylindrical surfaces."
+}

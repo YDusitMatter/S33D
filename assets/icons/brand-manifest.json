@@ -1,0 +1,48 @@
+{
+  "artwork": "s33d-artwork.png",
+  "artwork_revision": "2026-11-12-iron-walnut-approved-v1",
+  "artwork_origin": "User-supplied design, iteratively edited with built-in image generation and approved on 2026-11-12",
+  "source_artwork_sha256": "f79665fd29c24795fc87d407dcea4a63558807d44c79260003928e9d43766077",
+  "approved_generated_artwork_sha256": "84f546efa586a4d2a71d1446089546b915cbbb0396135e0c169dfe3632b621f5",
+  "artwork_sha256": "f7d9fc7c21fbe3a4560e518494c25c87acdc71d6781136879fcd3b0dd0fada56",
+  "artwork_size": [
+    1254,
+    1254
+  ],
+  "window_png_size": 512,
+  "ico_sizes": [
+    16,
+    20,
+    24,
+    32,
+    40,
+    48,
+    64,
+    96,
+    128,
+    256
+  ],
+  "roles_share_identical_artwork": true,
+  "files": [
+    {
+      "name": "s33d-seed.png",
+      "bytes": 435997,
+      "sha256": "1e523935db9187cc7ced3637b936664d781dd97df3519b4765629cbc4abc9bcc"
+    },
+    {
+      "name": "s33d-seed.ico",
+      "bytes": 186984,
+      "sha256": "a8a27a0c38c21ac00dbaad32d479332e1fe615e3067753efb7da16383a140ec2"
+    },
+    {
+      "name": "s33d-sprouted.png",
+      "bytes": 435997,
+      "sha256": "1e523935db9187cc7ced3637b936664d781dd97df3519b4765629cbc4abc9bcc"
+    },
+    {
+      "name": "s33d-sprouted.ico",
+      "bytes": 186984,
+      "sha256": "a8a27a0c38c21ac00dbaad32d479332e1fe615e3067753efb7da16383a140ec2"
+    }
+  ]
+}

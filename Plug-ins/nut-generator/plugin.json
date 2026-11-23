@@ -1,0 +1,8 @@
+{
+  "id": "nut-generator",
+  "name": "Nut Generator",
+  "version": "1.0.0",
+  "entry": "builtin:nut-generator",
+  "defaultEnabled": false,
+  "description": "Editable hex, square, round and flange nuts with modeled through threads and print clearance."
+}

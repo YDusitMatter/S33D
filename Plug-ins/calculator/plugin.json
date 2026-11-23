@@ -1,0 +1,8 @@
+{
+  "id": "calculator",
+  "name": "Scientific Calculator",
+  "version": "1.0.0",
+  "entry": "builtin:calculator",
+  "defaultEnabled": false,
+  "description": "Use a button-based scientific calculator with powers, roots, logarithms, and trigonometry."
+}

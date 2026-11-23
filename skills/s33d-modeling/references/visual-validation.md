@@ -1,0 +1,13 @@
+# Native visual validation
+
+Use s33d_render to receive a real MCP image of the native S33D model. This is independent of desktop capture and does not require computer-use. A path or JSON containing image data without an MCP image is not visual evidence. If the connected host cannot display MCP images, say the visual check is blocked rather than claiming it passed.
+
+Read view.get for the current world camera. Render defaults to a fitted copy of that camera and visible modeled objects, without changing GUI camera, selection, visibility, history or saved state. Pass body_ids for a deliberate subset (including explicitly selected hidden objects). Set fit:false when a supplied camera must be used exactly. view.set explicitly changes the GUI camera; it does not edit geometry.
+
+World directions are Front +Z, Back -Z, Right +X, Left -X, Top +Y, Bottom -Y, with Y up except top/bottom. Record the object's semantic front separately. Specify eye, target, up and projection when aligning a photograph; perspective fov_y_deg is a vertical angle, ortho_half is half the vertical visible span in mm. Fit accounts for both output dimensions.
+
+Follow the gates and actual execution record in [modeling-strategy.md](modeling-strategy.md). Compare similar viewpoint, projection, crop and object coverage. Check silhouette, major proportions, openings, feature positions and thickness in that order. Numeric bounds prove dimensions, not resemblance. Do not invent similarity percentages or pixel scores across unmatched perspective views. Choose views that resolve the current deviation; record retain/adjust/revert/change construction/blocker and recheck affected views. Do not require a fixed render or correction count. Final review returns to the original goal independently of the completed construction steps.
+
+Every returned image includes document_id/revision, camera, width/height and included body IDs. It represents that immutable document snapshot; later edits make it an older image. To demand a particular snapshot, provide _expected:{document_id,revision}. Re-query after manual edits, Undo/Redo or another document opening. Rendering excludes interactive draft previews, selection highlights, grid and section-tool clipping so those cannot masquerade as geometry.
+
+S33D currently renders base RGB with fixed native lighting. body.material.set supports base_color_srgb only (0..1 per channel); it preserves alpha, roughness and metalness. Those other material fields are not controllable by this interface and are not a physical rendering promise. Verify color state, image and saved/reopened project separately.

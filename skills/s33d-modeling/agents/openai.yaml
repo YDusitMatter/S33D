@@ -1,0 +1,11 @@
+interface:
+  display_name: "S33D Advanced Modeling"
+  short_description: "Build verified S33D models from text or images"
+  default_prompt: "Use $s33d-modeling to turn my text or reference image into a verified S33D model."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "s33d"
+      description: "Local S33D MCP bridge for inspecting and modifying the open model"
+      transport: "stdio"
