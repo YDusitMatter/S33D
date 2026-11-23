@@ -10,6 +10,8 @@ param(
     [string]$IsccPath,
     [string]$DumpbinPath,
     [string]$RuntimeDirectory,
+    [ValidateSet("en", "zh-CN")]
+    [string]$InstallLanguage = "en",
     [switch]$StageOnly
 )
 
@@ -118,7 +120,7 @@ foreach ($pluginId in $pluginIds) {
 }
 foreach ($relative in $payloadFiles) { $null = Get-RequiredFile $relative }
 $sourceReadme = Get-RequiredFile 'packaging/SOURCE-README.md'
-$installReadme = Get-RequiredFile 'packaging/INSTALL-README.txt'
+$installReadme = Get-RequiredFile $(if($InstallLanguage -eq 'zh-CN'){'packaging/INSTALL-README.zh-CN.txt'}else{'packaging/INSTALL-README.txt'})
 $installerScript = Get-RequiredFile 'packaging/windows/S33D.iss'
 
 Assert-X64 $appExe
@@ -240,6 +242,9 @@ Copy-Item -LiteralPath $sourceZip -Destination (Join-Path $sourceDirectory "S33D
 Copy-Item -LiteralPath $sourceReadme -Destination (Join-Path $sourceDirectory 'README.md')
 Copy-Item -LiteralPath $installReadme -Destination (Join-Path $stageRoot 'INSTALL-README.txt')
 
+[IO.File]::WriteAllText((Join-Path $stageRoot 'install-defaults.json'),
+    (@{default_language=$InstallLanguage}|ConvertTo-Json -Compress)+[Environment]::NewLine,
+    [Text.UTF8Encoding]::new($false))
 $inventory = @(Get-ChildItem -LiteralPath $stageRoot -File -Recurse | Sort-Object FullName | ForEach-Object {
     [ordered]@{
         path = $_.FullName.Substring($stageRoot.Length + 1).Replace('\', '/')
@@ -251,6 +256,8 @@ $packageManifest = [ordered]@{
     product = 'S33D Alpha Preview'
     version = $Version
     build_id = $buildId
+    installation_language = $InstallLanguage
+    default_ui_language = $InstallLanguage
     publisher = 'YDZM'
     architecture = 'x86_64-pc-windows-msvc'
     created_utc = [DateTime]::UtcNow.ToString('o')
@@ -262,9 +269,9 @@ $packageManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path
 $setupExe = $null
 if (-not $StageOnly) {
     $numericVersion = (($Version -split '-')[0]) + '.0'
-    & $resolvedIscc "/DAppVersion=$Version" "/DFileVersion=$numericVersion" "/DBuildId=$buildId" "/DStageDir=$stageRoot" "/DPackageOutputDir=$installerOutput" $installerScript
+    & $resolvedIscc "/DAppVersion=$Version" "/DFileVersion=$numericVersion" "/DBuildId=$buildId" "/DInstallLanguage=$InstallLanguage" "/DStageDir=$stageRoot" "/DPackageOutputDir=$installerOutput" $installerScript
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed; staged files are preserved at $stageRoot" }
-    $setupExe = Get-RequiredFile (Join-Path $installerOutput "S33D-$Version-build-$buildId-windows-x64-setup.exe")
+    $setupExe = Get-RequiredFile (Join-Path $installerOutput "S33D-$Version-build-$buildId-windows-x64-$InstallLanguage-setup.exe")
     $setupHash = Get-FileHash -LiteralPath $setupExe -Algorithm SHA256
     ('{0}  {1}' -f $setupHash.Hash.ToLowerInvariant(), [IO.Path]::GetFileName($setupExe)) |
         Set-Content -LiteralPath ($setupExe + '.sha256') -Encoding UTF8

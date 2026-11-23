@@ -501,3 +501,6 @@ File > Open Recent lists up to ten recently opened or successfully saved project
 
 
 The title bar and Help > About S33D show the build identifier. About also shows UTC build time and installation channel, with Copy version information for support. The installer filename carries the same identifier.
+
+
+English and Simplified Chinese installers set their respective language for first use. Existing saved language choices survive upgrades, including switching installer language. Both update the same S33D installation; Settings still allows language switching.

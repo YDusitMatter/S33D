@@ -2,6 +2,11 @@
 
 Candidate refresh: 2026-11-23. The preview name and version are unchanged.
 
+## 2026-11-23 bilingual distribution, build 20261123-2
+
+- Separate en and zh-CN installers use matching setup text, installation notes, first-run UI defaults and filenames. Both contain identical application binaries and update the same fixed Alpha Preview channel.
+- Existing saved language choices, settings and projects remain intact across upgrades and switching installer editions. Installation does not launch S33D or register an Agent automatically.
+
 ## 2026-11-23 desktop refresh, build 20261123-1
 
 - Includes Objects window dragging/scrolling, polygon bore fillet and consecutive chamfer corrections, cylindrical surface textures, cached edge picking and faster sketch-reference display.

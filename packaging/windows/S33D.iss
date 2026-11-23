@@ -25,6 +25,13 @@
   #error The corresponding source archive is required.
 #endif
 
+#ifndef InstallLanguage
+  #define InstallLanguage "en"
+#endif
+#if (InstallLanguage != "en") && (InstallLanguage != "zh-CN")
+  #error InstallLanguage must be en or zh-CN.
+#endif
+
 [Setup]
 AppId={{C9E61EA5-2E48-451C-A949-AF22067508AB}
 AppName=S33D Alpha Preview
@@ -40,6 +47,8 @@ VersionInfoCompany=YDZM
 DefaultDirName={localappdata}\Programs\S33D Alpha Preview
 DefaultGroupName=S33D Alpha Preview
 DisableProgramGroupPage=yes
+ShowLanguageDialog=no
+UsePreviousLanguage=no
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64os
 ArchitecturesInstallIn64BitMode=x64os
@@ -50,7 +59,7 @@ UninstallDisplayIcon={app}\assets\icons\s33d-sprouted.ico
 UninstallDisplayName=S33D Alpha Preview {#AppVersion}
 InfoBeforeFile={#StageDir}\INSTALL-README.txt
 OutputDir={#PackageOutputDir}
-OutputBaseFilename=S33D-{#AppVersion}-build-{#BuildId}-windows-x64-setup
+OutputBaseFilename=S33D-{#AppVersion}-build-{#BuildId}-windows-x64-{#InstallLanguage}-setup
 Compression=lzma2
 SolidCompression=yes
 CloseApplications=no
@@ -59,10 +68,27 @@ Uninstallable=yes
 SetupLogging=yes
 
 [Languages]
+#if InstallLanguage == "zh-CN"
+Name: "chinesesimplified"; MessagesFile: "languages\ChineseSimplified.isl"
+#else
 Name: "english"; MessagesFile: "compiler:Default.isl"
+#endif
+
+[CustomMessages]
+#if InstallLanguage == "zh-CN"
+S33DDesktop=创建桌面快捷方式
+S33DShortcuts=快捷方式：
+S33DUninstall=卸载 S33D Alpha Preview
+S33DUpdateBlocked=程序或 Agent 文件正在使用中，或安装目录不可写，无法更新 S33D。请关闭 S33D 及其 Agent 连接，检查安装目录权限后重试。尚未替换任何程序文件。
+#else
+S33DDesktop=Create a desktop shortcut
+S33DShortcuts=Shortcuts:
+S33DUninstall=Uninstall S33D Alpha Preview
+S33DUpdateBlocked=S33D cannot be updated while its program or Agent files are in use or not writable. Close S33D and its Agent connections, check access to the installation folder, then retry. No application files have been replaced.
+#endif
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
+Name: "desktopicon"; Description: "{cm:S33DDesktop}"; GroupDescription: "{cm:S33DShortcuts}"; Flags: unchecked
 
 [Files]
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -70,7 +96,7 @@ Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs c
 [Icons]
 Name: "{group}\S33D Alpha Preview"; Filename: "{app}\s33d-app.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\icons\s33d-sprouted.ico"
 Name: "{autodesktop}\S33D Alpha Preview"; Filename: "{app}\s33d-app.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\icons\s33d-sprouted.ico"; Tasks: desktopicon
-Name: "{group}\Uninstall S33D Alpha Preview"; Filename: "{uninstallexe}"
+Name: "{group}\{cm:S33DUninstall}"; Filename: "{uninstallexe}"
 
 ; Deliberately no Run, Registry, InstallDelete, or UninstallDelete sections.
 ; Uninstall removes only installed files/shortcuts tracked by Inno Setup.
@@ -107,8 +133,6 @@ begin
   if not CanUpdateExecutable(ExpandConstant('{app}\s33d-app.exe')) or
      not CanUpdateExecutable(ExpandConstant('{app}\s33d-agent.exe')) then begin
     Log('S33D upgrade preflight blocked before file copy.');
-    Result := 'S33D cannot be updated while its program or Agent files are in use or not writable. ' +
-      'Close S33D and its Agent connections, check access to the installation folder, then retry. ' +
-      'No application files have been replaced.';
+    Result := ExpandConstant('{cm:S33DUpdateBlocked}');
   end;
 end;

@@ -106,3 +106,8 @@ confirm the installed files/shortcuts disappear while a user-created project
 and `%LOCALAPPDATA%\S33D` settings remain. No installer `Run`, `Registry`,
 `InstallDelete`, or `UninstallDelete` sections are used. Only the files and
 shortcuts installed by Inno Setup are tracked for removal.
+
+
+## Installer editions
+
+`package-windows.ps1 -InstallLanguage en` (default) or `-InstallLanguage zh-CN` selects a single setup language and emits an edition suffix in the filename. Stage includes install-defaults.json with only default_language; it is installation-owned, never a user's ui_state.json. The desktop reads it from its executable directory only as a fallback when saved language is missing. Both editions share one AppId and preserve saved choices. Supply a new OutputDirectory for each edition.

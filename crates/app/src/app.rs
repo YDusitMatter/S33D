@@ -856,9 +856,46 @@ pub(crate) struct UiStateFile {
 const DEBUG_LOG_PATH: &str = "debug/click-log.txt";
 
 fn read_ui_state(path: &Path) -> Option<UiStateFile> {
-    std::fs::read_to_string(path)
+    read_ui_state_with_language(path, UiLanguage::English)
+}
+
+fn read_ui_state_with_language(path: &Path, initial_language: UiLanguage) -> Option<UiStateFile> {
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let has_language = value
+        .get("settings")
+        .and_then(|settings| settings.get("language"))
+        .is_some();
+    let mut state: UiStateFile = serde_json::from_value(value).ok()?;
+    if !has_language {
+        state.settings.language = initial_language;
+    }
+    Some(state)
+}
+
+fn installation_language_from_text(text: &str) -> UiLanguage {
+    let value: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
+    match value
+        .get("default_language")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("zh-CN") => UiLanguage::ChineseSimplified,
+        _ => UiLanguage::English,
+    }
+}
+
+fn installation_language() -> UiLanguage {
+    std::env::current_exe()
         .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
+        .and_then(|exe| exe.parent().map(|dir| dir.join("install-defaults.json")))
+        .filter(|path| {
+            std::fs::metadata(path)
+                .map(|m| m.len() <= 4096)
+                .unwrap_or(false)
+        })
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| installation_language_from_text(&text))
+        .unwrap_or(UiLanguage::English)
 }
 
 fn legacy_ui_state_paths() -> Vec<PathBuf> {
@@ -909,19 +946,29 @@ fn load_ui_state_from_paths(
     stable_path: &Path,
     legacy_paths: impl IntoIterator<Item = PathBuf>,
 ) -> UiStateFile {
-    if let Some(state) = read_ui_state(&stable_path) {
+    load_ui_state_with_language(stable_path, legacy_paths, installation_language())
+}
+
+fn load_ui_state_with_language(
+    stable_path: &Path,
+    legacy_paths: impl IntoIterator<Item = PathBuf>,
+    initial_language: UiLanguage,
+) -> UiStateFile {
+    if let Some(state) = read_ui_state_with_language(stable_path, initial_language) {
         return state;
     }
     for legacy_path in legacy_paths {
         if legacy_path == stable_path {
             continue;
         }
-        if let Some(state) = read_ui_state(&legacy_path) {
+        if let Some(state) = read_ui_state_with_language(&legacy_path, initial_language) {
             let _ = write_ui_state(&stable_path, &state);
             return state;
         }
     }
-    UiStateFile::default()
+    let mut state = UiStateFile::default();
+    state.settings.language = initial_language;
+    state
 }
 
 fn save_ui_state_checked(pos: Option<egui::Pos2>, settings: &AppSettings) -> Result<(), String> {
@@ -17510,6 +17557,71 @@ mod gizmo_tests {
                 ..
             } if operands == &[first, second]
         ));
+    }
+
+    #[test]
+    fn installation_language_defaults_preserve_saved_choice_and_legacy_settings() {
+        let dir = std::env::temp_dir().join(format!(
+            "s33d-language-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stable = dir.join("stable.json");
+        let legacy = dir.join("legacy.json");
+        for initial in [UiLanguage::English, UiLanguage::ChineseSimplified] {
+            let fresh = load_ui_state_with_language(&stable, [], initial);
+            assert_eq!(fresh.settings.language, initial);
+            std::fs::write(
+                &stable,
+                r#"{"settings":{"language":"English","beginner_mode":true}}"#,
+            )
+            .unwrap();
+            let saved = load_ui_state_with_language(&stable, [], initial);
+            assert_eq!(saved.settings.language, UiLanguage::English);
+            assert!(saved.settings.beginner_mode);
+            std::fs::write(&stable, r#"{"settings":{"language":"ChineseSimplified"}}"#).unwrap();
+            assert_eq!(
+                load_ui_state_with_language(&stable, [], initial)
+                    .settings
+                    .language,
+                UiLanguage::ChineseSimplified
+            );
+            std::fs::write(&stable, r#"{"settings":{"beginner_mode":true}}"#).unwrap();
+            let missing = load_ui_state_with_language(&stable, [], initial);
+            assert_eq!(missing.settings.language, initial);
+            assert!(missing.settings.beginner_mode);
+            std::fs::remove_file(&stable).unwrap();
+        }
+        std::fs::write(
+            &legacy,
+            r#"{"settings":{"language":"English","beginner_mode":true}}"#,
+        )
+        .unwrap();
+        let migrated =
+            load_ui_state_with_language(&stable, [legacy], UiLanguage::ChineseSimplified);
+        assert_eq!(migrated.settings.language, UiLanguage::English);
+        assert!(migrated.settings.beginner_mode);
+        assert_eq!(read_ui_state(&stable), Some(migrated));
+        for (text, expected) in [
+            (
+                r#"{"default_language":"zh-CN"}"#,
+                UiLanguage::ChineseSimplified,
+            ),
+            (r#"{"default_language":"en"}"#, UiLanguage::English),
+            ("bad json", UiLanguage::English),
+            (r#"{"default_language":"unknown"}"#, UiLanguage::English),
+        ] {
+            assert_eq!(installation_language_from_text(text), expected);
+        }
+        // Only the two files created by this test are removed.
+        for name in ["stable.json", "legacy.json"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

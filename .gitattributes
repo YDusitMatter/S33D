@@ -20,3 +20,6 @@
 *.stp -text
 *.glb -text
 *.zip -text
+
+packaging/windows/languages/ChineseSimplified.isl -text
+packaging/windows/languages/INNO-LICENSE.txt -text

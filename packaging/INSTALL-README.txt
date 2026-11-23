@@ -25,3 +25,6 @@ Third-party components retain their own licenses. In particular, OCCT is a
 separate component under its LGPL-2.1 license and OCCT exception; it is not
 covered by S33D's MPL license. See THIRD_PARTY_LICENSES.md, assets/licenses,
 and source/README.md. The corresponding source archive is installed in source/.
+
+The English installer defaults a fresh profile to English. Existing saved language
+choices are retained. English and Chinese packages update the same installation.

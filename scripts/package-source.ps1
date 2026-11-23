@@ -45,7 +45,8 @@ $relativeFiles = @(
     'Docs/AgentControl.md', 'Docs/PhotoToModel.md', 'Docs/ExactGeometryBuild.md', 'Docs/FastenerGenerators.md',
     'Docs/ThreadPrinting.md', 'Docs/SolidWorksCompatibility.md', 'Docs/LinuxPackaging.md',
     'packaging/README.md', 'packaging/SOURCE-README.md', 'packaging/RELEASE-NOTES.md',
-    'packaging/INSTALL-README.txt', 'packaging/windows/S33D.iss'
+    'packaging/INSTALL-README.txt', 'packaging/INSTALL-README.zh-CN.txt', 'packaging/windows/S33D.iss',
+    'packaging/windows/languages/ChineseSimplified.isl', 'packaging/windows/languages/INNO-LICENSE.txt', 'packaging/windows/languages/README.md'
 )
 function Get-PublicFiles([string]$Directory) {
     foreach ($item in Get-ChildItem -LiteralPath $Directory -Force) {

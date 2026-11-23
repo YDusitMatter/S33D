@@ -270,3 +270,6 @@ Exact offset/shell requires original STEP surfaces. Choose offset, hollow with r
 
 
 标题栏与 Help > 关于 S33D 提供构建编号；关于窗口显示构建时间（UTC）、安装渠道和“复制版本信息”，安装包文件名包含同一编号。
+
+
+英文/简体中文安装包的安装界面与首次默认语言对应；升级保留已有语言偏好，两个包使用同一安装渠道。
