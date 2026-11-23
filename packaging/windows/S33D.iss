@@ -72,3 +72,40 @@ Name: "{group}\Uninstall S33D Alpha Preview"; Filename: "{uninstallexe}"
 ; Deliberately no Run, Registry, InstallDelete, or UninstallDelete sections.
 ; Uninstall removes only installed files/shortcuts tracked by Inno Setup.
 ; User projects, %LOCALAPPDATA%\S33D, and external Agent registration survive.
+
+[Code]
+function OpenUpdateTarget(FileName: String; DesiredAccess, ShareMode: LongWord;
+  SecurityAttributes: THandle; CreationDisposition, FlagsAndAttributes: LongWord;
+  TemplateFile: THandle): THandle;
+  external 'CreateFileW@kernel32.dll stdcall';
+
+function CloseUpdateTarget(Handle: THandle): Boolean;
+  external 'CloseHandle@kernel32.dll stdcall';
+
+function CanUpdateExecutable(const FileName: String): Boolean;
+var
+  Handle: THandle;
+begin
+  Result := True;
+  if not FileExists(FileName) then
+    Exit;
+  { Check write access without changing bytes. Sharing zero also detects a
+    running executable or another process holding the file open. }
+  Handle := OpenUpdateTarget(FileName, $C0000000, 0, 0, 3, $80, 0);
+  if Handle = THandle(-1) then
+    Result := False
+  else
+    CloseUpdateTarget(Handle);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  if not CanUpdateExecutable(ExpandConstant('{app}\s33d-app.exe')) or
+     not CanUpdateExecutable(ExpandConstant('{app}\s33d-agent.exe')) then begin
+    Log('S33D upgrade preflight blocked before file copy.');
+    Result := 'S33D cannot be updated while its program or Agent files are in use or not writable. ' +
+      'Close S33D and its Agent connections, check access to the installation folder, then retry. ' +
+      'No application files have been replaced.';
+  end;
+end;

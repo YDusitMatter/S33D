@@ -4,6 +4,7 @@ Candidate refresh: 2026-11-23. The preview name and version are unchanged.
 
 ## 2026-11-23 normal Windows Alpha Preview channel
 
+- Before copying an update, Setup checks write access to the selected installation's application and Agent executables. Busy or non-writable executables stop Setup before application files are replaced; Setup does not force-close user programs.
 - The normal per-user Windows channel uses a fixed application identity and installation directory so later packages can update the same installation. Installation does not launch S33D or register an Agent automatically.
 - Includes the November 22 modeling/menu/export updates and synchronized manuals. Windows native dependency diagnostics are built with neutral source paths, including UTF-16 assertion messages.
 - This candidate is unsigned. Local installation and upgrade checks do not replace clean-machine, physical display/GPU or real visual Agent host acceptance.
