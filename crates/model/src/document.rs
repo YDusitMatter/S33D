@@ -361,6 +361,8 @@ pub enum SurfaceTextureSurface {
         x_axis: [f64; 3],
         radius: f64,
         length: f64,
+        #[serde(default)]
+        internal: bool,
     },
 }
 

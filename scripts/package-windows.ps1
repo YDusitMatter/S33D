@@ -123,9 +123,14 @@ $installerScript = Get-RequiredFile 'packaging/windows/S33D.iss'
 
 Assert-X64 $appExe
 Assert-X64 $agentExe
-$productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($appExe).ProductVersion
+$appVersionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($appExe)
+$productVersion = $appVersionInfo.ProductVersion
 if ($productVersion -ne $Version) {
     throw "s33d-app.exe ProductVersion is '$productVersion'; expected '$Version'. Build both release binaries with the final icons first."
+}
+$buildId = $appVersionInfo.PrivateBuild
+if ($buildId -notmatch '^[A-Za-z0-9-]{1,32}$') {
+    throw 's33d-app.exe is missing a valid build identifier. Rebuild the release binaries.'
 }
 $agentVersion = @(& $agentExe --version 2>&1)
 if ($LASTEXITCODE -ne 0 -or ($agentVersion -join '').Trim() -ne "s33d-agent $Version") {
@@ -245,6 +250,7 @@ $inventory = @(Get-ChildItem -LiteralPath $stageRoot -File -Recurse | Sort-Objec
 $packageManifest = [ordered]@{
     product = 'S33D Alpha Preview'
     version = $Version
+    build_id = $buildId
     publisher = 'YDZM'
     architecture = 'x86_64-pc-windows-msvc'
     created_utc = [DateTime]::UtcNow.ToString('o')
@@ -256,15 +262,16 @@ $packageManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path
 $setupExe = $null
 if (-not $StageOnly) {
     $numericVersion = (($Version -split '-')[0]) + '.0'
-    & $resolvedIscc "/DAppVersion=$Version" "/DFileVersion=$numericVersion" "/DStageDir=$stageRoot" "/DPackageOutputDir=$installerOutput" $installerScript
+    & $resolvedIscc "/DAppVersion=$Version" "/DFileVersion=$numericVersion" "/DBuildId=$buildId" "/DStageDir=$stageRoot" "/DPackageOutputDir=$installerOutput" $installerScript
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed; staged files are preserved at $stageRoot" }
-    $setupExe = Get-RequiredFile (Join-Path $installerOutput "S33D-$Version-windows-x64-setup.exe")
+    $setupExe = Get-RequiredFile (Join-Path $installerOutput "S33D-$Version-build-$buildId-windows-x64-setup.exe")
     $setupHash = Get-FileHash -LiteralPath $setupExe -Algorithm SHA256
     ('{0}  {1}' -f $setupHash.Hash.ToLowerInvariant(), [IO.Path]::GetFileName($setupExe)) |
         Set-Content -LiteralPath ($setupExe + '.sha256') -Encoding UTF8
 }
 [pscustomobject]@{
     Version = $Version
+    BuildId = $buildId
     StageDirectory = $stageRoot
     Installer = $setupExe
     BundledRuntimeDlls = @($bundledDlls.Keys | Sort-Object)

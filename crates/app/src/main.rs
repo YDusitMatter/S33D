@@ -37,7 +37,11 @@ fn main() -> eframe::Result {
     // argument. Keep it intact (including spaces and non-ASCII characters).
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let viewport = egui::ViewportBuilder::default()
-        .with_title(identity::PRODUCT_NAME)
+        .with_title(format!(
+            "{} · Build {}",
+            identity::PRODUCT_NAME,
+            identity::BUILD_ID
+        ))
         .with_decorations(false)
         .with_resizable(false)
         .with_inner_size([768.0, 1024.0])

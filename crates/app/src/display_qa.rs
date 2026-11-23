@@ -152,6 +152,66 @@ impl Screen {
 }
 
 #[test]
+fn long_objects_window_scrolls_and_can_be_dragged_vertically() {
+    let mut s = Screen::new(
+        UiLanguage::English,
+        UiFontSize::Standard,
+        UiAppearance::default(),
+    );
+    s.app.objects_panel_open = true;
+    s.app.objects_panel_pos = Some(egui::pos2(120.0, 45.0));
+    for number in 1..=80 {
+        let id = s.app.doc.alloc_id();
+        s.app.doc.add_body(s33d_model::Body {
+            id,
+            name: format!("Example {number}"),
+            kind: s33d_model::BodyKind::Solid,
+            feature: s33d_model::Feature::Imported {
+                path: String::new(),
+            },
+            shape: None,
+            material: Default::default(),
+            visible: true,
+        });
+    }
+    s.settle();
+    let before = s.app.objects_panel_pos.unwrap();
+    let title = before + egui::vec2(90.0, 18.0);
+    let destination = title + egui::vec2(0.0, 110.0);
+    let pointer_button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    s.frame(vec![egui::Event::PointerMoved(title)]);
+    s.frame(vec![pointer_button(title, true)]);
+    s.frame(vec![egui::Event::PointerMoved(destination)]);
+    s.frame(vec![pointer_button(destination, false)]);
+    s.settle();
+    let after = s.app.objects_panel_pos.unwrap();
+    assert!(after.y > before.y + 70.0, "window remained at {after:?}");
+    assert!((after.x - before.x).abs() < 1.0);
+
+    let inside_list = after + egui::vec2(100.0, 120.0);
+    for _ in 0..6 {
+        s.frame(vec![
+            egui::Event::PointerMoved(inside_list),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -500.0),
+                modifiers: Default::default(),
+            },
+        ]);
+    }
+    s.settle();
+    assert!(
+        s.paint_visible("Example 80 (solid)"),
+        "last row should scroll into view"
+    );
+}
+
+#[test]
 fn display_camera_sidebar_does_not_grow_and_all_four_hit_rects_fit() {
     for appearance in UiAppearance::ALL {
         for language in [UiLanguage::English, UiLanguage::ChineseSimplified] {

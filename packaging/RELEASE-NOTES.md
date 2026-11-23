@@ -2,6 +2,12 @@
 
 Candidate refresh: 2026-11-23. The preview name and version are unchanged.
 
+## 2026-11-23 desktop refresh, build 20261123-1
+
+- Includes Objects window dragging/scrolling, polygon bore fillet and consecutive chamfer corrections, cylindrical surface textures, cached edge picking and faster sketch-reference display.
+- Title bar, About and installer filename share build 20261123-1; About adds UTC build time, installation channel and Copy version information. The Alpha Preview product version and fixed upgrade identity remain unchanged.
+- English/Chinese Help follows the updated desktop. No new MCP tools. A reported polygon-selection issue on an existing surface sketch remains under investigation; this candidate does not claim it fixed.
+
 ## 2026-11-23 normal Windows Alpha Preview channel
 
 - Before copying an update, Setup checks write access to the selected installation's application and Agent executables. Busy or non-writable executables stop Setup before application files are replaced; Setup does not force-close user programs.

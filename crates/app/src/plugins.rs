@@ -1171,8 +1171,8 @@ impl S33DPlugin for SurfaceTexturePlugin {
                     .show(ui, |ui| {
                         ui.label(
                     egui::RichText::new(language.text(
-                        "Select a planar face or a parametric cylinder side in the viewport.",
-                        "请在工作区选择一个平面，或参数化圆柱的连续侧面。",
+                        "Select a planar face or a complete cylindrical wall in the viewport.",
+                        "请在工作区选择平面或完整圆柱壁。",
                     ))
                     .small()
                     .weak(),

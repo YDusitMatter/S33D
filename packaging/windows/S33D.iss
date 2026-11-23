@@ -6,6 +6,9 @@
 #ifndef FileVersion
   #define FileVersion "0.1.0.0"
 #endif
+#ifndef BuildId
+  #error BuildId is required; use scripts/package-windows.ps1.
+#endif
 #ifndef StageDir
   #error StageDir is required; use scripts/package-windows.ps1.
 #endif
@@ -47,7 +50,7 @@ UninstallDisplayIcon={app}\assets\icons\s33d-sprouted.ico
 UninstallDisplayName=S33D Alpha Preview {#AppVersion}
 InfoBeforeFile={#StageDir}\INSTALL-README.txt
 OutputDir={#PackageOutputDir}
-OutputBaseFilename=S33D-{#AppVersion}-windows-x64-setup
+OutputBaseFilename=S33D-{#AppVersion}-build-{#BuildId}-windows-x64-setup
 Compression=lzma2
 SolidCompression=yes
 CloseApplications=no

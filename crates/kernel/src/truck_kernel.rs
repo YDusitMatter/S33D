@@ -120,6 +120,164 @@ fn clean_region_ring(ring: &[[f64; 2]]) -> Result<Vec<[f64; 2]>> {
 }
 
 impl TruckKernel {
+    /// Build the selected portions of a straight-walled hole's planar rim.
+    /// Two selected neighbors share the cross-section on the angle bisector.
+    pub fn mitered_hole_chamfer_cutter(
+        &self,
+        rim: &[EdgeCutterSegment],
+        selected: &[bool],
+        distance: f64,
+    ) -> Result<MeshData> {
+        let invalid = || KernelError::Geometry("cannot form a continuous hole-rim chamfer".into());
+        if rim.len() < 3 || selected.len() != rim.len() || !distance.is_finite() || distance <= 0.0
+        {
+            return Err(invalid());
+        }
+        let first = &rim[0];
+        let pair = |edge: &EdgeCutterSegment| {
+            [
+                DVec3::from_array(edge.n1).normalize(),
+                DVec3::from_array(edge.n2).normalize(),
+            ]
+        };
+        let [first_normal, second_normal] = pair(first);
+        let normal = [first_normal, second_normal]
+            .into_iter()
+            .find(|normal| {
+                rim.iter()
+                    .all(|edge| pair(edge).into_iter().any(|n| n.dot(*normal) > 0.9999))
+            })
+            .ok_or_else(invalid)?;
+        let side_normals = rim
+            .iter()
+            .map(|edge| {
+                let [a, b] = pair(edge);
+                let side = if a.dot(normal) > b.dot(normal) { b } else { a };
+                (side.dot(normal).abs() < 1e-3)
+                    .then(|| (side - normal * side.dot(normal)).normalize())
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(invalid)?;
+        let n = rim.len();
+        let points: Vec<_> = rim.iter().map(|edge| DVec3::from_array(edge.a)).collect();
+        if rim.iter().enumerate().any(|(i, edge)| {
+            let end = DVec3::from_array(edge.b);
+            !points[i].is_finite()
+                || !end.is_finite()
+                || end.distance_squared(points[(i + 1) % n]) > 1e-10
+                || end.distance_squared(points[i]) < 1e-16
+        }) {
+            return Err(invalid());
+        }
+        let mut offsets = vec![DVec3::ZERO; n];
+        for i in 0..n {
+            let previous = (i + n - 1) % n;
+            offsets[i] = match (selected[previous], selected[i]) {
+                (true, true) => {
+                    // The intersection of the two unit-offset lines.
+                    let bisector = side_normals[previous] + side_normals[i];
+                    let length_squared = bisector.length_squared();
+                    if length_squared < 1e-12 {
+                        return Err(invalid());
+                    }
+                    -2.0 * bisector / length_squared
+                }
+                (true, false) => -side_normals[previous],
+                (false, true) => -side_normals[i],
+                (false, false) => DVec3::ZERO,
+            };
+        }
+        let too_wide = || {
+            KernelError::Geometry("chamfer distance makes neighboring hole-rim cuts cross".into())
+        };
+        let projected: Vec<_> = points
+            .iter()
+            .zip(&offsets)
+            .map(|(&p, &m)| p + m * distance)
+            .collect();
+        let mut pad = (distance * 0.1).clamp(0.01, 0.25);
+        for i in (0..n).filter(|&i| selected[i]) {
+            let j = (i + 1) % n;
+            let edge = points[j] - points[i];
+            let length = edge.length_squared();
+            if (projected[j] - projected[i]).dot(edge) <= 1e-9 * length {
+                return Err(too_wide());
+            }
+            let extension = (offsets[j] - offsets[i]).dot(edge);
+            if extension > 0.0 {
+                pad = pad.min(length / (4.0 * extension));
+            }
+            for k in (i + 1..n).filter(|&k| selected[k]) {
+                let l = (k + 1) % n;
+                if j == k || l == i {
+                    continue;
+                }
+                let side = |a: usize, b: usize, c: usize| {
+                    (projected[b] - projected[a])
+                        .cross(projected[c] - projected[a])
+                        .dot(normal)
+                };
+                if side(i, j, k) * side(i, j, l) < 0.0 && side(k, l, i) * side(k, l, j) < 0.0 {
+                    return Err(too_wide());
+                }
+            }
+        }
+        let mut positions = Vec::new();
+        let mut sections = vec![0u32; n];
+        for i in 0..n {
+            if !selected[(i + n - 1) % n] && !selected[i] {
+                continue;
+            }
+            sections[i] = positions.len() as u32;
+            let point = points[i];
+            positions.extend(
+                [
+                    point + (normal - offsets[i]) * pad,
+                    projected[i],
+                    point - normal * distance,
+                ]
+                .map(|point| point.as_vec3().to_array()),
+            );
+        }
+        let mut indices = Vec::new();
+        for i in 0..n {
+            if !selected[i] {
+                continue;
+            }
+            let next = (i + 1) % n;
+            let (a, b) = (sections[i], sections[next]);
+            for j in 0..3 {
+                let k = (j + 1) % 3;
+                indices.extend_from_slice(&[a + j, b + j, b + k, a + j, b + k, a + k]);
+            }
+            if !selected[(i + n - 1) % n] {
+                indices.extend_from_slice(&[a, a + 1, a + 2]);
+            }
+            if !selected[next] {
+                indices.extend_from_slice(&[b, b + 2, b + 1]);
+            }
+        }
+        let origin = DVec3::from_array(first.a);
+        let signed_volume = indices
+            .chunks_exact(3)
+            .map(|triangle| {
+                let [a, b, c] = [0, 1, 2].map(|i| {
+                    DVec3::from_array(positions[triangle[i] as usize].map(f64::from)) - origin
+                });
+                a.dot(b.cross(c)) / 6.0
+            })
+            .sum::<f64>();
+        if !signed_volume.is_finite() || signed_volume.abs() < 1e-12 {
+            return Err(invalid());
+        }
+        if signed_volume < 0.0 {
+            for triangle in indices.chunks_exact_mut(3) {
+                triangle.swap(1, 2);
+            }
+        }
+        Ok(MeshData::new(positions, indices))
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -645,6 +803,14 @@ fn fit_circular_edge_chain(segments: &[EdgeCutterSegment]) -> Option<CircularEdg
         return None;
     }
     let radius = radius_sq.sqrt();
+    // Vertices of a regular polygon also lie on a circle. Its long chords
+    // must retain their corners instead of receiving a round cutter.
+    if segments
+        .iter()
+        .any(|s| DVec3::from_array(s.a).distance(DVec3::from_array(s.b)) > radius * 0.4)
+    {
+        return None;
+    }
     let center = centroid + basis_u * cx + basis_v * cy;
     let radial_tol = (radius * 1e-3).max(1e-5);
     if points.iter().any(|p| {
@@ -696,11 +862,9 @@ struct PlanarEdgeLoop {
     scale: f64,
 }
 
-/// 识别并有向化“平面面 + 近似垂直侧壁”的平滑闭合棱链。
-///
-/// 该路径覆盖圆角矩形、椭圆和其它由直线/小角度弧段组成的内外轮廓；
-/// 真正的尖角（相邻段转角 > 25°）保留给原逐段 fallback，避免错误 miter 自交。
-fn fit_smooth_planar_edge_loop(segments: &[EdgeCutterSegment]) -> Option<PlanarEdgeLoop> {
+/// Recognize a closed planar lip with near-vertical sides. Sharp miter joins
+/// are used on hole rims, where the cut widens towards the surrounding solid.
+fn fit_planar_edge_loop(segments: &[EdgeCutterSegment]) -> Option<PlanarEdgeLoop> {
     if segments.len() < 3 {
         return None;
     }
@@ -849,15 +1013,27 @@ fn fit_smooth_planar_edge_loop(segments: &[EdgeCutterSegment]) -> Option<PlanarE
     let max_turn_cos = 25.0f64.to_radians().cos();
     let max_normal_turn_cos = 35.0f64.to_radians().cos();
     let n = ordered_points.len();
+    let winding = (0..n)
+        .map(|i| {
+            (ordered_points[i] - centroid)
+                .cross(ordered_points[(i + 1) % n] - centroid)
+                .dot(plane_normal)
+        })
+        .sum::<f64>();
+    let hole_rim = winding.abs() > 1e-10
+        && (0..n).all(|i| {
+            let tangent = (ordered_points[(i + 1) % n] - ordered_points[i]).normalize();
+            ordered_sides[i].dot(plane_normal.cross(tangent) * winding.signum()) > 0.9
+        });
     for i in 0..n {
         let previous_dir = (ordered_points[i] - ordered_points[(i + n - 1) % n]).normalize();
         let next_dir = (ordered_points[(i + 1) % n] - ordered_points[i]).normalize();
-        if previous_dir.dot(next_dir) < max_turn_cos {
+        if !hole_rim && previous_dir.dot(next_dir) < max_turn_cos {
             return None;
         }
         let previous_side = ordered_sides[(i + n - 1) % n];
         let next_side = ordered_sides[i];
-        if previous_side.dot(next_side) < max_normal_turn_cos {
+        if !hole_rim && previous_side.dot(next_side) < max_normal_turn_cos {
             return None;
         }
     }
@@ -883,6 +1059,38 @@ impl TruckKernel {
         chamfer: Option<f64>,
         fillet: Option<f64>,
     ) -> Result<MeshData> {
+        self.edge_cutter_prism(a, b, n1, n2, chamfer, fillet, false)
+    }
+
+    /// Build an additive profile inside a re-entrant corner. Its caps stop at
+    /// the original endpoints so a through-hole does not acquire raised tabs.
+    pub fn concave_edge_cutter(
+        &mut self,
+        edge: &EdgeCutterSegment,
+        chamfer: Option<f64>,
+        fillet: Option<f64>,
+    ) -> Result<MeshData> {
+        self.edge_cutter_prism(
+            edge.a,
+            edge.b,
+            edge.n1.map(|x| -x),
+            edge.n2.map(|x| -x),
+            chamfer,
+            fillet,
+            true,
+        )
+    }
+
+    fn edge_cutter_prism(
+        &mut self,
+        a: [f64; 3],
+        b: [f64; 3],
+        n1: [f64; 3],
+        n2: [f64; 3],
+        chamfer: Option<f64>,
+        fillet: Option<f64>,
+        additive: bool,
+    ) -> Result<MeshData> {
         let pa = DVec3::from_array(a);
         let pb = DVec3::from_array(b);
         let e = pb - pa;
@@ -891,6 +1099,12 @@ impl TruckKernel {
             return Err(KernelError::Geometry("degenerate edge".into()));
         }
         let e = e / len;
+        let overrun = if additive { 0.0 } else { 2.0 };
+        let padding = if additive {
+            chamfer.or(fillet).unwrap_or(0.0) * 0.1
+        } else {
+            2.0
+        };
         let (u, v, outer) = edge_cutter_profile(
             pa,
             e,
@@ -898,11 +1112,11 @@ impl TruckKernel {
             DVec3::from_array(n2),
             chamfer,
             fillet,
-            2.0,
+            padding,
             None,
         )?;
         // 刀具平面：原点 = a - e*2（两端各突出 2mm），沿 e 挤出 len+4
-        let origin = pa - e * 2.0;
+        let origin = pa - e * overrun;
         // 沿 e 挤出
         let plane = PlaneDef {
             origin: [origin.x, origin.y, origin.z],
@@ -914,7 +1128,7 @@ impl TruckKernel {
             holes: Vec::new(),
         };
         let face = self.region_to_face(&region, &plane)?;
-        let solid = extrude_face(&face, &plane, len + 4.0);
+        let solid = extrude_face(&face, &plane, len + 2.0 * overrun);
         let mesh = tessellate_solid(&solid);
         let mut mesh = mesh;
         mesh.weld(1e-5);
@@ -1000,18 +1214,16 @@ impl TruckKernel {
         .map(Some)
     }
 
-    /// 若棱链是平滑、共面的闭合轮廓，则沿整圈生成一个共享拓扑的 sweep 刀具。
-    ///
-    /// 与圆形 fast path 不同，这里不假设恒定半径，适用于圆角矩形等由直线和
-    /// 小角度弧段组成的内轮廓。每个截面环共享相邻段顶点，因此不会产生逐段
-    /// 挤出刀具的重叠包络和角部薄片。
+    /// 沿共面的平滑闭环或多边形孔缘生成一个共用截面。
+    /// 相邻线段共用角部截面，避免逐段切削留下接缝。
     pub fn closed_planar_edge_cutter(
         &mut self,
         segments: &[EdgeCutterSegment],
         chamfer: Option<f64>,
         fillet: Option<f64>,
+        additive: bool,
     ) -> Result<Option<MeshData>> {
-        let Some(edge_loop) = fit_smooth_planar_edge_loop(segments) else {
+        let Some(edge_loop) = fit_planar_edge_loop(segments) else {
             return Ok(None);
         };
         let amount = chamfer.or(fillet).ok_or_else(|| {
@@ -1033,7 +1245,10 @@ impl TruckKernel {
             let point = edge_loop.points[i];
             let previous_dir = (point - edge_loop.points[(i + n - 1) % n]).normalize();
             let next_dir = (edge_loop.points[(i + 1) % n] - point).normalize();
-            let tangent = (previous_dir + next_dir).normalize();
+            let tangent = (previous_dir + next_dir).normalize_or_zero();
+            if tangent.length_squared() < 1e-18 {
+                return Ok(None);
+            }
             let previous_side = edge_loop.side_normals[(i + n - 1) % n];
             let next_side = edge_loop.side_normals[i];
             let mut side = previous_side + next_side;
@@ -1042,11 +1257,12 @@ impl TruckKernel {
                 return Ok(None);
             }
             side = side.normalize();
+            let orientation = if additive { -1.0 } else { 1.0 };
             let (u, v, outer) = edge_cutter_profile(
                 point,
                 tangent,
-                edge_loop.plane_normal,
-                side,
+                orientation * edge_loop.plane_normal,
+                orientation * side,
                 chamfer,
                 fillet,
                 padding,
@@ -1070,7 +1286,7 @@ impl TruckKernel {
             let denominator =
                 ((u.dot(previous_inward).abs() + u.dot(next_inward).abs()) * 0.5).max(0.25);
             let miter_scale = 1.0 / denominator;
-            if miter_scale > 2.0 {
+            if miter_scale > 2.0 + 1e-8 {
                 return Ok(None);
             }
             for p in outer {
@@ -1897,7 +2113,7 @@ mod tests {
             .unwrap()
             .is_none());
         let cutter = k
-            .closed_planar_edge_cutter(&segments, None, Some(1.5))
+            .closed_planar_edge_cutter(&segments, None, Some(1.5), false)
             .unwrap()
             .expect("rounded rectangle should use continuous sweep");
         assert_watertight(&cutter);
@@ -1921,7 +2137,7 @@ mod tests {
     }
 
     #[test]
-    fn sharp_closed_rectangle_does_not_use_smooth_sweep() {
+    fn sharp_outer_rectangle_does_not_use_smooth_sweep() {
         let points = [
             DVec3::new(-5.0, -4.0, 3.0),
             DVec3::new(5.0, -4.0, 3.0),
@@ -1932,7 +2148,7 @@ mod tests {
         for i in 0..points.len() {
             let next = (i + 1) % points.len();
             let tangent = (points[next] - points[i]).normalize();
-            let side = DVec3::Z.cross(tangent).normalize();
+            let side = tangent.cross(DVec3::Z).normalize();
             segments.push(EdgeCutterSegment {
                 a: points[i].to_array(),
                 b: points[next].to_array(),
@@ -1942,7 +2158,7 @@ mod tests {
         }
         let mut k = TruckKernel::new();
         assert!(k
-            .closed_planar_edge_cutter(&segments, None, Some(1.0))
+            .closed_planar_edge_cutter(&segments, None, Some(1.0), false)
             .unwrap()
             .is_none());
     }

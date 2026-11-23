@@ -585,6 +585,8 @@ pub fn draw(app: &mut S33DApp, ctx: &egui::Context) {
         .default_pos(default_pos)
         .default_width(160.0)
         .min_width(140.0)
+        .max_height((ctx.screen_rect().height() * 0.58).max(80.0))
+        .vscroll(true)
         .resizable(true)
         .constrain(true)
         .open(&mut open)
@@ -2288,6 +2290,18 @@ fn about_window(app: &mut S33DApp, ctx: &egui::Context) {
                 language.text("Version", "版本"),
                 crate::identity::VERSION
             ));
+            ui.label(format!("{} {}", language.text("Build", "构建"), crate::identity::BUILD_ID));
+            ui.label(format!("{}: {}", language.text("Built (UTC)", "构建时间（UTC）"), crate::identity::BUILD_TIME));
+            let channel = match crate::identity::BUILD_CHANNEL {
+                "alpha-preview" => language.text("Normal installation", "普通安装版"),
+                "local-test" => language.text("Independent test", "独立测试版"),
+                _ => language.text("Development", "开发构建"),
+            };
+            ui.label(format!("{}: {}", language.text("Channel", "安装渠道"), channel));
+            if ui.button(language.text("Copy version information", "复制版本信息")).clicked() {
+                ui.ctx().copy_text(crate::identity::version_report());
+            }
+
             ui.label(format!(
                 "{}: {}",
                 language.text("Author", "作者"),
@@ -2376,6 +2390,7 @@ mod about_tests {
             for expected in [
                 crate::identity::PRODUCT_NAME,
                 crate::identity::VERSION,
+                crate::identity::BUILD_ID,
                 author_label,
                 license_label,
                 "THIRD_PARTY_LICENSES.md",
@@ -9060,7 +9075,15 @@ fn viewport(app: &mut S33DApp, ui: &mut egui::Ui) {
             .or_else(|| response.hover_pos())
         {
             app.on_pointer_move(pos, rect);
-            app.update_hover(pos, rect);
+            let navigating = app.mode == Mode::Idle
+                && (response.dragged_by(egui::PointerButton::Middle)
+                    || response.dragged_by(egui::PointerButton::Secondary)
+                    || ui.input(|input| input.raw_scroll_delta.y != 0.0));
+            if navigating {
+                app.clear_hover_preview();
+            } else {
+                app.update_hover(pos, rect);
+            }
         }
     } else {
         app.clear_hover_preview();

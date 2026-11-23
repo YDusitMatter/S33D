@@ -317,6 +317,8 @@ struct PickGeometry {
     mesh: MeshData,
     chains: Vec<Vec<EdgeSeg>>,
     edge_to_chain: HashMap<(usize, usize), usize>,
+    projected_edges: Mutex<Option<ProjectedEdgeIndex>>,
+    chamfer_sides: Mutex<HashMap<(BodyId, ShapeId, usize, usize), Option<Vec<EdgeSeg>>>>,
 }
 
 impl PickGeometry {
@@ -364,7 +366,103 @@ impl PickGeometry {
             mesh,
             chains,
             edge_to_chain,
+            projected_edges: Mutex::new(None),
+            chamfer_sides: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn inner_rim(&self, seed: &EdgeSeg) -> Option<Vec<EdgeSeg>> {
+        use glam::DVec3;
+        let vertex = |point: [f32; 3]| point.map(f32::to_bits);
+        let origin = DVec3::from_array(seed.a.map(f64::from));
+        let start = vertex(seed.a);
+        for normal in [seed.n1, seed.n2] {
+            let axis = DVec3::from_array(normal.map(f64::from));
+            let mut edges = Vec::new();
+            let mut adjacency = HashMap::<[u32; 3], Vec<usize>>::new();
+            for edge in self.chains.iter().flatten() {
+                let a = DVec3::from_array(edge.a.map(f64::from));
+                let b = DVec3::from_array(edge.b.map(f64::from));
+                if [a, b]
+                    .into_iter()
+                    .any(|p| (p - origin).dot(axis).abs() > 1e-3)
+                {
+                    continue;
+                }
+                let n1 = DVec3::from_array(edge.n1.map(f64::from));
+                let n2 = DVec3::from_array(edge.n2.map(f64::from));
+                let side = if n1.dot(axis) > 0.9999 {
+                    n2
+                } else if n2.dot(axis) > 0.9999 {
+                    n1
+                } else {
+                    continue;
+                };
+                if side.dot(axis).abs() > 0.15 {
+                    continue;
+                }
+                let index = edges.len();
+                adjacency.entry(vertex(edge.a)).or_default().push(index);
+                adjacency.entry(vertex(edge.b)).or_default().push(index);
+                edges.push((edge, side));
+            }
+            let Some(first) = edges.iter().position(|(edge, _)| {
+                (vertex(edge.a) == start && vertex(edge.b) == vertex(seed.b))
+                    || (vertex(edge.b) == start && vertex(edge.a) == vertex(seed.b))
+            }) else {
+                continue;
+            };
+            let mut current = start;
+            let mut index = first;
+            let mut ring = Vec::new();
+            let mut sides = Vec::new();
+            while ring.len() < edges.len() {
+                let (edge, side) = edges[index];
+                let mut edge = edge.clone();
+                if current != vertex(edge.a) {
+                    std::mem::swap(&mut edge.a, &mut edge.b);
+                }
+                current = vertex(edge.b);
+                ring.push(edge);
+                sides.push(side);
+                let Some(neighbors) = adjacency.get(&current).filter(|edges| edges.len() == 2)
+                else {
+                    break;
+                };
+                if current == start {
+                    break;
+                }
+                index = if neighbors[0] == index {
+                    neighbors[1]
+                } else {
+                    neighbors[0]
+                };
+            }
+            if current != start
+                || ring.len() < 3
+                || adjacency.get(&start).is_none_or(|edges| edges.len() != 2)
+            {
+                continue;
+            }
+            let winding = ring
+                .iter()
+                .map(|edge| {
+                    let a = DVec3::from_array(edge.a.map(f64::from)) - origin;
+                    let b = DVec3::from_array(edge.b.map(f64::from)) - origin;
+                    a.cross(b).dot(axis)
+                })
+                .sum::<f64>();
+            if winding.abs() > 1e-9
+                && ring.iter().zip(&sides).all(|(edge, side)| {
+                    let tangent = DVec3::from_array(edge.b.map(f64::from))
+                        - DVec3::from_array(edge.a.map(f64::from));
+                    side.dot(axis.cross(tangent.normalize()) * winding.signum()) > 0.9
+                })
+            {
+                return Some(ring);
+            }
+        }
+        None
     }
 }
 
@@ -1355,6 +1453,10 @@ pub struct S33DApp {
     pub applied_version: u64,
     pub mesh_cache: HashMap<ShapeId, MeshData>,
     pick_geometry_cache: HashMap<ShapeId, Arc<PickGeometry>>,
+    sketch_reference_cache: HashMap<ShapeId, SketchReferenceGeometry>,
+    face_patch_cache: HashMap<ShapeId, Arc<FacePatchTopology>>,
+    sketch_reference_snap_key: Option<(Vec<ShapeId>, glam::Vec3, PlaneDef)>,
+    sketch_marker_projection: Option<SketchMarkerProjection>,
     measurement_cache: HashMap<ShapeId, (glam::Vec3, glam::Vec3, f64, f64)>,
     last_hover_query: Option<(egui::Pos2, egui::Rect, u64, Mode, bool)>,
     /// Section View 剖切缓存：shape + 平面键 → 两半网格与法线。
@@ -1570,6 +1672,10 @@ impl S33DApp {
             applied_version: u64::MAX,
             mesh_cache: HashMap::new(),
             pick_geometry_cache: HashMap::new(),
+            sketch_reference_cache: HashMap::new(),
+            face_patch_cache: HashMap::new(),
+            sketch_reference_snap_key: None,
+            sketch_marker_projection: None,
             measurement_cache: HashMap::new(),
             last_hover_query: None,
             section_cache: HashMap::new(),
@@ -2124,32 +2230,27 @@ impl S33DApp {
     }
 
     /// Convert the currently selected face into stable construction geometry
-    /// for the Surface Texture plug-in. Parametric cylinders are promoted from
-    /// the clicked side facet to their complete continuous lateral surface.
+    /// for the Surface Texture plug-in. Use the verified complete wall so a
+    /// facet, location or an obsolete primitive definition cannot change its axis.
     pub fn surface_texture_target_for_plugin(&mut self) -> Option<(BodyId, SurfaceTextureSurface)> {
         let face = self.face_pick.clone()?;
-        let body = self.doc.body(face.body_id)?.clone();
-        let primitive = draw_3d_params_from_feature(&body.feature);
-        if let Some(params) = primitive.filter(|params| params.kind == Primitive3DKind::Cylinder) {
-            let frame = params.frame.unwrap_or_else(|| DatumPlane::Top.def());
-            let axis = frame.normal().normalize();
-            let face_normal = glam::DVec3::from_array(face.normal.map(f64::from)).normalize();
-            if axis.dot(face_normal).abs() < 0.72 {
-                let base = glam::DVec3::from_array(params.position);
-                return Some((
-                    face.body_id,
-                    SurfaceTextureSurface::Cylinder {
-                        center: (base + axis * (params.height * 0.5)).to_array(),
-                        axis: axis.to_array(),
-                        x_axis: frame.x_axis().to_array(),
-                        radius: params.radius,
-                        length: params.height,
-                    },
-                ));
-            }
+        let shape = self.doc.body(face.body_id)?.shape?;
+        if let Some(wall) = self.thread_target_for_face(&face) {
+            let axis = glam::DVec3::from_array(wall.axis).normalize();
+            return Some((
+                face.body_id,
+                SurfaceTextureSurface::Cylinder {
+                    center: (glam::DVec3::from_array(wall.origin) + axis * (wall.length * 0.5))
+                        .to_array(),
+                    axis: axis.to_array(),
+                    x_axis: PlaneDef::from_normal(axis.to_array()).x_axis().to_array(),
+                    radius: wall.radius,
+                    length: wall.length,
+                    internal: wall.internal,
+                },
+            ));
         }
 
-        let shape = body.shape?;
         let mesh = self.mesh_for(shape);
         let normal = glam::DVec3::from_array(face.normal.map(f64::from)).normalize();
         let frame = PlaneDef::from_normal(normal.to_array());
@@ -2576,6 +2677,10 @@ impl S33DApp {
         self.mesh_cache.retain(|shape, _| live.contains(shape));
         self.pick_geometry_cache
             .retain(|shape, _| live.contains(shape));
+        self.sketch_reference_cache
+            .retain(|shape, _| live.contains(shape));
+        self.face_patch_cache
+            .retain(|shape, _| live.contains(shape));
         self.measurement_cache
             .retain(|shape, _| live.contains(shape));
         self.cylinder_pick_cache
@@ -2827,6 +2932,10 @@ impl S33DApp {
         self.regions_cache.clear();
         self.mesh_cache.clear();
         self.pick_geometry_cache.clear();
+        self.sketch_reference_cache.clear();
+        self.face_patch_cache.clear();
+        self.sketch_reference_snap_key = None;
+        self.sketch_marker_projection = None;
         self.measurement_cache.clear();
         self.last_hover_query = None;
         self.section_cache.clear();
@@ -6087,6 +6196,8 @@ impl S33DApp {
         self.sketch_edit_original_selection.clear();
         self.sketch_on_body = None; // 基准面草图：无目标体
         self.saved_camera = Some(self.camera.clone());
+        self.sketch_reference_snap_key = None;
+        self.sketch_marker_projection = None;
         self.mode = Mode::Sketch;
         self.sketch_tools_open = true;
         // 正视平面（先取数据再 move）
@@ -6130,6 +6241,8 @@ impl S33DApp {
         self.sketch_edit_original_doc = Some(self.doc.clone());
         self.sketch_edit_original_selection = self.selected.clone();
         self.saved_camera = Some(self.camera.clone());
+        self.sketch_reference_snap_key = None;
+        self.sketch_marker_projection = None;
         self.mode = Mode::Sketch;
         self.sketch_tools_open = true;
         self.sketch_on_body = sk.on_body;
@@ -6221,8 +6334,6 @@ impl S33DApp {
             self.restore_view();
             self.mode = Mode::Idle;
             self.selected = vec![id];
-            self.mesh_cache.clear();
-            self.section_cache.clear();
             self.collect_kernel_garbage();
             self.bump_scene();
             let regions = self.regions_of(id);
@@ -6506,56 +6617,10 @@ impl S33DApp {
                         .map(|shape| (shape, feature.clone()))
                 } else {
                     match &feature {
-                        Feature::Chamfer {
-                            target,
-                            base,
-                            edges,
-                            reference_bounds,
-                            chamfer,
-                            fillet,
-                        } => {
-                            let base_id = base.unwrap_or(*target);
-                            let base_shape = rebuilt_shapes
-                                .get(&base_id)
-                                .copied()
-                                .or_else(|| self.doc.body(base_id).and_then(|body| body.shape))
-                                .ok_or_else(|| format!("Base object {base_id} is missing"));
-                            base_shape.and_then(|base_shape| {
-                                let mesh = self
-                                    .kernel
-                                    .tessellate(base_shape)
-                                    .map_err(|error| error.to_string())?;
-                                let stored = stored_chamfer_segments(edges);
-                                let segments = match reference_bounds {
-                                    Some(reference_bounds) => remap_chamfer_segments(
-                                        &mesh,
-                                        &stored,
-                                        *reference_bounds,
-                                    )
-                                    .ok_or_else(|| {
-                                        "the selected edge no longer resolves on the rebuilt base"
-                                            .to_string()
-                                    })?,
-                                    None => stored,
-                                };
-                                let bounds = mesh_reference_bounds(&mesh);
-                                self.evaluate_chamfer_feature(
-                                    base_shape, &segments, *chamfer, *fillet,
-                                )
-                                .map(|(shape, _)| {
-                                    (
-                                        shape,
-                                        Feature::Chamfer {
-                                            target: *target,
-                                            base: *base,
-                                            edges: model_chamfer_segments(&segments),
-                                            reference_bounds: bounds,
-                                            chamfer: *chamfer,
-                                            fillet: *fillet,
-                                        },
-                                    )
-                                })
-                            })
+                        Feature::Chamfer { .. } => {
+                            let mut rebuilt_feature = feature.clone();
+                            self.evaluate_chamfer_operation(&mut rebuilt_feature, &rebuilt, true)
+                                .map(|(shape, _)| (shape, rebuilt_feature))
                         }
                         _ => continue,
                     }
@@ -6754,8 +6819,6 @@ impl S33DApp {
         if let Some(original) = self.sketch_edit_original_doc.take() {
             self.doc = original;
             self.selected = std::mem::take(&mut self.sketch_edit_original_selection);
-            self.mesh_cache.clear();
-            self.section_cache.clear();
         } else {
             self.sketch_edit_original_selection.clear();
         }
@@ -9246,7 +9309,7 @@ impl S33DApp {
             .ok_or_else(|| "Cannot restore the operation base".to_string())?;
 
         let updates = self
-            .evaluate_chamfer_rebuilds(replacement_base, replacement_shape, &rebuild_order)
+            .evaluate_chamfer_rebuilds(replacement_base, replacement_shape, None, &rebuild_order)
             .map_err(|error| format!("Cannot remove this operation: {error}"))?;
 
         self.begin_document_change();
@@ -10181,6 +10244,15 @@ impl S33DApp {
         let surface_sketch_plane = (self.mode == Mode::Sketch && self.sketch_on_body.is_some())
             .then(|| self.sketch.as_ref().map(|sketch| sketch.plane))
             .flatten();
+        let reference_key = surface_sketch_plane.map(|plane| {
+            (
+                solids.iter().map(|(_, shape, ..)| *shape).collect(),
+                self.camera.eye,
+                plane,
+            )
+        });
+        let update_reference_points = self.sketch_reference_snap_key != reference_key;
+        self.sketch_reference_snap_key = reference_key;
         let mut surface_reference_points = Vec::new();
         for (_id, shape, color, highlight, preview_role) in solids {
             if self
@@ -10292,9 +10364,15 @@ impl S33DApp {
                     },
                     opacity: 0.18,
                 });
-                let (visible_edges, hidden_edges) =
-                    sketch_reference_edges(&mesh, self.camera.eye, 22.0);
-                if let Some(plane) = surface_sketch_plane {
+                let reference = self.sketch_reference_cache.entry(shape).or_insert_with(|| {
+                    let input = self
+                        .kernel
+                        .tessellate(shape)
+                        .unwrap_or_else(|_| mesh.clone());
+                    SketchReferenceGeometry::new(input, 22.0)
+                });
+                let (visible_edges, hidden_edges) = reference.lines(self.camera.eye);
+                if let Some(plane) = surface_sketch_plane.filter(|_| update_reference_points) {
                     for edge in visible_edges.chunks_exact(2) {
                         let a = edge[0].map(|value| value as f64);
                         let b = edge[1].map(|value| value as f64);
@@ -10313,7 +10391,7 @@ impl S33DApp {
                 }
                 if !visible_edges.is_empty() {
                     scene.body_edge_lines.push(SceneLines {
-                        positions: visible_edges,
+                        positions: visible_edges.to_vec(),
                         color: if appearance == crate::appearance::UiAppearance::PorcelainWorkshop {
                             crate::appearance::rgb(egui::Color32::from_rgb(88, 114, 148))
                         } else {
@@ -10323,7 +10401,7 @@ impl S33DApp {
                 }
                 if !hidden_edges.is_empty() {
                     scene.body_edge_lines.push(SceneLines {
-                        positions: hidden_edges,
+                        positions: hidden_edges.to_vec(),
                         color: if appearance == crate::appearance::UiAppearance::PorcelainWorkshop {
                             crate::appearance::rgb(egui::Color32::from_rgb(152, 167, 185))
                         } else {
@@ -10370,8 +10448,11 @@ impl S33DApp {
                 }
             }
         }
-        if let Some(sketch) = self.sketch.as_mut() {
-            sketch.set_external_key_points(surface_reference_points);
+        if update_reference_points {
+            self.sketch_marker_projection = None;
+            if let Some(sketch) = self.sketch.as_mut() {
+                sketch.set_external_key_points(surface_reference_points);
+            }
         }
 
         // Sketch lines follow Super3D's pale-blue drafting color on the dark viewport.
@@ -10554,10 +10635,31 @@ impl S33DApp {
                 let x_axis = v3(sk.plane.x_axis()).normalize_or_zero();
                 let y_axis = v3(sk.plane.y_axis()).normalize_or_zero();
                 let normal = v3(sk.plane.normal()).normalize_or_zero();
-                for point in sk.key_points() {
-                    let world = v3(glam::DVec3::from_array(
-                        sk.plane.to_world(point[0], point[1]),
-                    )) + normal * 0.5;
+                let rect = self.viewport_rect;
+                let view_proj = self
+                    .camera
+                    .proj_matrix(rect.width() / rect.height().max(1.))
+                    * self.camera.view_matrix();
+                let origin = sk.plane.origin();
+                let u = sk.plane.x_axis();
+                let v = sk.plane.y_axis();
+                let marker_world =
+                    |point: [f64; 2]| v3(origin + u * point[0] + v * point[1]) + normal * 0.5;
+                if self
+                    .sketch_marker_projection
+                    .as_ref()
+                    .is_none_or(|projection| {
+                        projection.view_proj != view_proj || projection.rect != rect
+                    })
+                {
+                    self.sketch_marker_projection = Some(SketchMarkerProjection::new(
+                        view_proj,
+                        rect,
+                        sk.external_key_points.iter().copied().map(marker_world),
+                    ));
+                }
+                let mut cells = HashSet::new();
+                let mut draw_marker = |world| {
                     let radius = (self.world_per_pixel_at(world) * 3.2).max(0.08);
                     append_sketch_point_marker(
                         &mut scene.sketch_point_lines.positions,
@@ -10566,6 +10668,18 @@ impl S33DApp {
                         y_axis,
                         radius,
                     );
+                };
+                for point in sk.entity_marker_points() {
+                    let world = marker_world(point);
+                    cells.insert(SketchMarkerProjection::cell(project_edge_point(
+                        &view_proj, rect, world,
+                    )));
+                    draw_marker(world);
+                }
+                for &(cell, world) in &self.sketch_marker_projection.as_ref().unwrap().markers {
+                    if !cells.contains(&cell) {
+                        draw_marker(world);
+                    }
                 }
             }
         }
@@ -10943,6 +11057,7 @@ impl S33DApp {
             return m.clone();
         }
         if let Ok(m) = self.kernel.tessellate(shape) {
+            self.face_patch_cache.remove(&shape);
             // 焊接重复顶点 + 按面夹角分组平滑法线（CAD 硬边）：
             // 弧面条带间（约 5°）法线平滑，顶/底面与侧面（90°）保持硬边，
             // 避免全平滑导致的边缘软阴影环
@@ -11583,6 +11698,86 @@ impl S33DApp {
 
     // ================= Chamfer / Fillet（棱线识别 + CSG 倒角/圆角）=================
 
+    fn picking_geometry(&mut self, shape: ShapeId) -> Arc<PickGeometry> {
+        if let Some(cached) = self.pick_geometry_cache.get(&shape) {
+            return Arc::clone(cached);
+        }
+        let geometry = Arc::new(PickGeometry::new(self.mesh_for(shape)));
+        if self.pick_geometry_cache.len() >= 64 {
+            self.pick_geometry_cache.clear();
+        }
+        self.pick_geometry_cache
+            .insert(shape, Arc::clone(&geometry));
+        geometry
+    }
+
+    fn is_circular_chamfer_rim(
+        &mut self,
+        body_id: BodyId,
+        shape: ShapeId,
+        rim: &[EdgeSeg],
+    ) -> bool {
+        use glam::DVec3;
+        let contains_rim = |origin: DVec3, axis: DVec3, radius: f64, axial: Option<f64>| {
+            let tolerance = crate::mesh_cylinders::fit_tolerance(radius);
+            rim.iter().all(|edge| {
+                let p = DVec3::from_array(edge.a.map(f64::from)) - origin;
+                let z = p.dot(axis);
+                ((p - axis * z).length() - radius).abs() <= tolerance
+                    && axial.is_none_or(|length| {
+                        z.abs() <= tolerance || (z - length).abs() <= tolerance
+                    })
+            })
+        };
+        let sketch_has_circle = |sketch: &SketchFeature| {
+            sketch.entities.iter().any(|entity| {
+                let SketchEntity::Circle { c, r } = entity else {
+                    return false;
+                };
+                contains_rim(
+                    DVec3::from_array(sketch.plane.to_world(c[0], c[1])),
+                    sketch.plane.normal(),
+                    *r,
+                    None,
+                )
+            })
+        };
+        if let Some(body) = self.doc.body(body_id) {
+            if body.feature.sketch().is_some_and(sketch_has_circle) {
+                return true;
+            }
+            if let Feature::Extrude {
+                pocket_source_sketches,
+                ..
+            } = &body.feature
+            {
+                if pocket_source_sketches.iter().any(|&id| {
+                    self.doc
+                        .body(id)
+                        .and_then(Body::sketch)
+                        .is_some_and(sketch_has_circle)
+                }) {
+                    return true;
+                }
+            }
+        }
+        self.kernel.exact_shape(shape).is_some()
+            && self
+                .cylinder_targets_for_pick(body_id, shape)
+                .iter()
+                .any(|wall| {
+                    // Mesh-inferred walls use the high bit. A faceted polygon
+                    // with equally spaced vertices still has individual sides.
+                    wall.face_id < 0x8000_0000
+                        && contains_rim(
+                            DVec3::from_array(wall.origin),
+                            DVec3::from_array(wall.axis),
+                            wall.radius,
+                            Some(wall.length),
+                        )
+                })
+    }
+
     /// 拾取悬停位置最近的锐棱链（屏幕距离 < 6px；圆形棱整条识别）。
     pub fn pick_edge(&mut self, pos: egui::Pos2, rect: egui::Rect) -> Option<EdgeRef> {
         let ndc = screen_to_ndc(pos, rect);
@@ -11598,19 +11793,9 @@ impl S33DApp {
             .filter(|b| b.kind == BodyKind::Solid && b.visible)
             .filter_map(|b| b.shape.map(|s| (b.id, s)))
             .collect();
-        let mut best: Option<(EdgeRef, f32)> = None; // (edge, 屏幕距离)
+        let mut best = None;
         for (body_id, shape) in &solids {
-            let geometry = if let Some(cached) = self.pick_geometry_cache.get(shape) {
-                Arc::clone(cached)
-            } else {
-                let cached = Arc::new(PickGeometry::new(self.mesh_for(*shape)));
-                // Bound transient-preview retention between document GC passes.
-                if self.pick_geometry_cache.len() >= 64 {
-                    self.pick_geometry_cache.clear();
-                }
-                self.pick_geometry_cache.insert(*shape, Arc::clone(&cached));
-                cached
-            };
+            let geometry = self.picking_geometry(*shape);
             let m = &geometry.mesh;
             if m.is_empty() {
                 continue;
@@ -11618,36 +11803,64 @@ impl S33DApp {
             let Some((tri, _)) = ray_mesh_tri(ro, rd, &m) else {
                 continue;
             };
-            let t = &m.indices[tri * 3..tri * 3 + 3];
-            for (i, j) in [(0usize, 1usize), (1, 2), (2, 0)] {
-                let (ti, tj) = (t[i] as usize, t[j] as usize);
-                let key = if ti < tj { (ti, tj) } else { (tj, ti) };
-                let Some(&chain) = geometry.edge_to_chain.get(&key) else {
-                    continue;
-                };
-                let segments = geometry.chains[chain].clone();
-                if segments.is_empty() {
-                    continue;
-                }
-                // 屏幕距离：链折线各段投影距离的最小值
-                let mut sd = f32::INFINITY;
-                for s in &segments {
-                    let pa = glam::Vec3::from_array(s.a);
-                    let pb = glam::Vec3::from_array(s.b);
-                    sd = sd.min(edge_screen_dist(&view_proj, rect, pos, pa, pb));
-                }
-                if sd < 6.0 && best.as_ref().map(|(_, d)| sd < *d).unwrap_or(true) {
-                    best = Some((
-                        EdgeRef {
-                            body_id: *body_id,
-                            segments,
-                        },
-                        sd,
-                    ));
+            if let Some((chain, segment, distance)) =
+                closest_edge_on_hit_face(&geometry, tri, &view_proj, rect, pos)
+            {
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, _, _, _, closest)| distance < *closest)
+                {
+                    best = Some((*body_id, geometry, chain, segment, distance));
                 }
             }
         }
-        best.map(|(e, _)| e)
+        let (body_id, geometry, chain_id, segment, _) = best?;
+        let chain = &geometry.chains[chain_id];
+        let segments = (chain.len() > 1 && (!self.chamfer_active || !self.chamfer_fillet))
+            .then(|| self.picked_chamfer_side(body_id, &geometry, chain_id, segment))
+            .flatten()
+            .unwrap_or_else(|| chain.clone());
+        Some(EdgeRef { body_id, segments })
+    }
+
+    fn picked_chamfer_side(
+        &mut self,
+        body_id: BodyId,
+        geometry: &PickGeometry,
+        chain: usize,
+        segment: usize,
+    ) -> Option<Vec<EdgeSeg>> {
+        let root_id = match self.doc.body(body_id).map(|body| &body.feature) {
+            Some(Feature::Chamfer { target, .. }) => *target,
+            _ => body_id,
+        };
+        let shape = self.doc.body(root_id)?.shape?;
+        let key = (root_id, shape, chain, segment);
+        if let Some(side) = geometry.chamfer_sides.lock().unwrap().get(&key) {
+            return side.clone();
+        }
+        let original = self.picking_geometry(shape);
+        let picked = &geometry.chains[chain][segment];
+        let side = find_polygon_chamfer_rim(&original, std::slice::from_ref(picked), 0.0).and_then(
+            |(rim, sides)| {
+                if self.is_circular_chamfer_rim(root_id, shape, &rim) {
+                    return None;
+                }
+                Some(
+                    geometry.chains[chain]
+                        .iter()
+                        .filter(|edge| matches_original_chamfer_edge(edge, &rim[sides[0]]))
+                        .cloned()
+                        .collect(),
+                )
+            },
+        );
+        let mut cached = geometry.chamfer_sides.lock().unwrap();
+        if cached.len() >= 4096 {
+            cached.clear();
+        }
+        cached.insert(key, side.clone());
+        side
     }
 
     /// 查找某目标体当前应继续使用的 chamfer/fillet 结果 body。
@@ -11684,6 +11897,39 @@ impl S33DApp {
             .collect();
 
         self.report_model_progress(("Preparing edge treatment…", "正在准备棱边处理…"), None)?;
+        // At a re-entrant corner the two faces extend into the positive
+        // half-space of their neighbor. Rounding fills that void sector.
+        if let Some(first) = kernel_segments.first() {
+            let mesh = self.mesh_for(base);
+            if is_reentrant_edge(&mesh, first) {
+                let addition = if kernel_segments.len() == 1 {
+                    self.kernel
+                        .concave_edge_cutter(first, chamfer, fillet)
+                        .map_err(|e| format!("Cutter failed: {e}"))?
+                } else {
+                    if !kernel_segments[1..]
+                        .iter()
+                        .all(|segment| is_reentrant_edge(&mesh, segment))
+                    {
+                        return Err(format!("{name} needs separate convex and concave edges"));
+                    }
+                    self.kernel
+                        .closed_planar_edge_cutter(&kernel_segments, chamfer, fillet, true)
+                        .map_err(|e| format!("Cutter failed: {e}"))?
+                        .ok_or_else(|| format!("{name} could not join the concave edge chain"))?
+                };
+                self.report_model_progress(
+                    ("Applying edge treatment…", "正在计算棱边结果…"),
+                    None,
+                )?;
+                let cutter = self.kernel.insert_mesh(addition);
+                let result = self.kernel.boolean_union(base, cutter);
+                self.kernel.delete(cutter);
+                return result
+                    .map(|shape| (shape, segments.len()))
+                    .map_err(|e| format!("{name} failed on interior corner: {e}"));
+            }
+        }
         let mut continuous_kind = "circular";
         let mut continuous_cutter = self
             .kernel
@@ -11693,7 +11939,7 @@ impl S33DApp {
             continuous_kind = "closed contour";
             continuous_cutter = self
                 .kernel
-                .closed_planar_edge_cutter(&kernel_segments, chamfer, fillet)
+                .closed_planar_edge_cutter(&kernel_segments, chamfer, fillet, false)
                 .map_err(|e| format!("Cutter failed: {e}"))?;
         }
 
@@ -11824,11 +12070,163 @@ impl S33DApp {
         Ok((shape, fallback_segments.len()))
     }
 
+    fn evaluate_chamfer_operation(
+        &mut self,
+        feature: &mut Feature,
+        rebuilt: &[(BodyId, ShapeId, Feature)],
+        remap: bool,
+    ) -> Result<(ShapeId, usize), String> {
+        let Feature::Chamfer {
+            target,
+            base,
+            edges,
+            reference_bounds,
+            chamfer,
+            fillet,
+        } = feature
+        else {
+            return Err("Expected a chamfer or fillet feature".into());
+        };
+        let target = *target;
+        let base_id = base.unwrap_or(target);
+        let shape_for = |id| {
+            rebuilt
+                .iter()
+                .rev()
+                .find(|item| item.0 == id)
+                .map(|item| item.1)
+                .or_else(|| self.doc.body(id).and_then(|body| body.shape))
+        };
+        let base_shape =
+            shape_for(base_id).ok_or_else(|| format!("Base object {base_id} is missing"))?;
+        let target_shape =
+            shape_for(target).ok_or_else(|| format!("Target object {target} is missing"))?;
+        let mut segments = stored_chamfer_segments(edges);
+
+        if let (Some(distance), None) = (*chamfer, *fillet) {
+            let root = PickGeometry::new(
+                self.kernel
+                    .tessellate(target_shape)
+                    .map_err(|e| e.to_string())?,
+            );
+            let mut rim = find_polygon_chamfer_rim(&root, &segments, distance);
+            if rim.is_none()
+                && remap
+                && self.doc.body(target).and_then(|body| body.shape) != Some(target_shape)
+            {
+                if let (Some(old_target), Some(bounds)) = (
+                    self.doc.body(target).and_then(|body| body.shape),
+                    *reference_bounds,
+                ) {
+                    let old_root = PickGeometry::new(
+                        self.kernel
+                            .tessellate(old_target)
+                            .map_err(|e| e.to_string())?,
+                    );
+                    if find_polygon_chamfer_rim(&old_root, &segments, distance).is_some() {
+                        if let Some(mapped) = remap_chamfer_segments(&root.mesh, &segments, bounds)
+                        {
+                            rim = find_polygon_chamfer_rim(&root, &mapped, distance);
+                        }
+                    }
+                }
+            }
+            if let Some((rim, picked)) = rim {
+                let mut selected = vec![false; rim.len()];
+                for &i in &picked {
+                    selected[i] = true;
+                }
+                let mut source_id = base_id;
+                let mut visited = HashSet::new();
+                while source_id != target && visited.insert(source_id) {
+                    let ancestor = rebuilt
+                        .iter()
+                        .rev()
+                        .find(|item| item.0 == source_id)
+                        .map(|item| &item.2)
+                        .or_else(|| self.doc.body(source_id).map(|body| &body.feature));
+                    let Some(Feature::Chamfer {
+                        target: ancestor_target,
+                        base,
+                        edges,
+                        chamfer: Some(width),
+                        fillet: None,
+                        ..
+                    }) = ancestor
+                    else {
+                        break;
+                    };
+                    if *ancestor_target != target || (width - distance).abs() > 1e-5 {
+                        break;
+                    }
+                    let Some(previous) = recover_polygon_chamfer_sides(
+                        &rim,
+                        &stored_chamfer_segments(edges),
+                        *width,
+                    ) else {
+                        break;
+                    };
+                    if previous.iter().any(|&i| selected[i]) {
+                        break;
+                    }
+                    for i in previous {
+                        selected[i] = true;
+                    }
+                    source_id = base.unwrap_or(target);
+                }
+                let source = shape_for(source_id)
+                    .ok_or_else(|| format!("Base object {source_id} is missing"))?;
+                self.report_model_progress(
+                    ("Joining hole-rim chamfers…", "正在接合孔口倒角…"),
+                    None,
+                )?;
+                let rim_segments = rim
+                    .iter()
+                    .map(|edge| EdgeCutterSegment {
+                        a: edge.a.map(f64::from),
+                        b: edge.b.map(f64::from),
+                        n1: edge.n1.map(f64::from),
+                        n2: edge.n2.map(f64::from),
+                    })
+                    .collect::<Vec<_>>();
+                let cutter = self
+                    .kernel
+                    .mitered_hole_chamfer_cutter(&rim_segments, &selected, distance)
+                    .map_err(|e| e.to_string())?;
+                let cutter = self.kernel.insert_mesh(cutter);
+                let result = self.kernel.boolean_subtract(source, cutter);
+                self.kernel.delete(cutter);
+                let shape = result.map_err(|e| format!("Could not join hole-rim chamfers: {e}"))?;
+                let normalized = picked.iter().map(|&i| rim[i].clone()).collect::<Vec<_>>();
+                *edges = model_chamfer_segments(&normalized);
+                *reference_bounds = mesh_reference_bounds(&root.mesh);
+                return Ok((shape, picked.len()));
+            }
+        }
+
+        let mesh = self
+            .kernel
+            .tessellate(base_shape)
+            .map_err(|e| e.to_string())?;
+        if remap {
+            if let Some(bounds) = *reference_bounds {
+                segments = remap_chamfer_segments(&mesh, &segments, bounds).ok_or_else(|| {
+                    "the selected edge no longer resolves on the rebuilt base".to_string()
+                })?;
+            }
+        }
+        let result = self.evaluate_chamfer_feature(base_shape, &segments, *chamfer, *fillet)?;
+        *edges = model_chamfer_segments(&segments);
+        *reference_bounds = mesh_reference_bounds(&mesh);
+        Ok(result)
+    }
+
     /// 以一个已经重算好的节点为种子，按父子顺序重算其后的特征。
     fn evaluate_chamfer_rebuilds(
         &mut self,
         seed_id: BodyId,
         seed_shape: ShapeId,
+        seed_feature: Option<&Feature>,
         order: &[(BodyId, BodyId)],
     ) -> Result<
         Vec<(
@@ -11840,55 +12238,39 @@ impl S33DApp {
         )>,
         String,
     > {
-        let mut rebuilt_shapes: HashMap<BodyId, ShapeId> = HashMap::new();
-        rebuilt_shapes.insert(seed_id, seed_shape);
+        let mut rebuilt = vec![(
+            seed_id,
+            seed_shape,
+            seed_feature
+                .cloned()
+                .or_else(|| self.doc.body(seed_id).map(|body| body.feature.clone()))
+                .ok_or_else(|| format!("Base object {seed_id} is missing"))?,
+        )];
         let mut updates = Vec::with_capacity(order.len());
         for &(child_id, new_base) in order {
-            let child = self
+            let mut feature = self
                 .doc
                 .body(child_id)
-                .cloned()
+                .map(|body| body.feature.clone())
                 .ok_or_else(|| format!("Dependent operation {child_id} is missing"))?;
-            let (edges, reference_bounds, chamfer, fillet) = match &child.feature {
-                Feature::Chamfer {
-                    edges,
-                    reference_bounds,
-                    chamfer,
-                    fillet,
-                    ..
-                } => (edges, *reference_bounds, *chamfer, *fillet),
-                _ => continue,
+            let Feature::Chamfer { base, .. } = &mut feature else {
+                continue;
             };
-            let base_shape = rebuilt_shapes
-                .get(&new_base)
-                .copied()
-                .or_else(|| self.doc.body(new_base).and_then(|body| body.shape))
-                .ok_or_else(|| format!("Base object {new_base} is missing"))?;
-            let mesh = self
-                .kernel
-                .tessellate(base_shape)
-                .map_err(|error| error.to_string())?;
-            let stored = stored_chamfer_segments(edges);
-            let segments = match reference_bounds {
-                Some(reference_bounds) => remap_chamfer_segments(&mesh, &stored, reference_bounds)
-                    .ok_or_else(|| {
-                        format!("Chamfer {child_id} selected edge no longer resolves")
-                    })?,
-                None => stored,
-            };
+            *base = Some(new_base);
             let (shape, _) = self
-                .evaluate_chamfer_feature(base_shape, &segments, chamfer, fillet)
+                .evaluate_chamfer_operation(&mut feature, &rebuilt, true)
                 .map_err(|error| {
                     format!("Chamfer {child_id} cannot be rebuilt after the edit: {error}")
                 })?;
-            rebuilt_shapes.insert(child_id, shape);
-            updates.push((
-                child_id,
-                new_base,
-                shape,
-                model_chamfer_segments(&segments),
-                mesh_reference_bounds(&mesh),
-            ));
+            if let Feature::Chamfer {
+                edges,
+                reference_bounds,
+                ..
+            } = &feature
+            {
+                updates.push((child_id, new_base, shape, edges.clone(), *reference_bounds));
+            }
+            rebuilt.push((child_id, shape, feature));
         }
         Ok(updates)
     }
@@ -11909,10 +12291,10 @@ impl S33DApp {
             Some(Feature::Chamfer { target: t, .. }) => *t,
             _ => target,
         };
-        let Some(target_shape) = self.doc.body(target).and_then(|b| b.shape) else {
+        if self.doc.body(target).and_then(|b| b.shape).is_none() {
             self.toast("Edge body has no shape");
             return;
-        };
+        }
         // 基础体（链式累积）：
         // - 更新当前 object（未 Done）：用该 object 记录的 base
         // - Done 后新 object：用最新的 chamfer 结果（没有则原目标体）
@@ -11942,11 +12324,6 @@ impl S33DApp {
                 })
                 .unwrap_or(target)
         };
-        let base = self
-            .doc
-            .body(base_body)
-            .and_then(|b| b.shape)
-            .unwrap_or(target_shape);
         let d = self.chamfer_param.max(0.05) as f64;
         let (chamfer, fillet) = if self.chamfer_fillet {
             (None, Some(d))
@@ -11958,14 +12335,21 @@ impl S33DApp {
         } else {
             "Chamfer"
         };
-        let (shape, seg_count) =
-            match self.evaluate_chamfer_feature(base, &edge.segments, chamfer, fillet) {
-                Ok(result) => result,
-                Err(error) => {
-                    self.toast(error);
-                    return;
-                }
-            };
+        let mut feature = Feature::Chamfer {
+            target,
+            base: Some(base_body),
+            edges: model_chamfer_segments(&edge.segments),
+            reference_bounds: None,
+            chamfer,
+            fillet,
+        };
+        let (shape, seg_count) = match self.evaluate_chamfer_operation(&mut feature, &[], false) {
+            Ok(result) => result,
+            Err(error) => {
+                self.toast(error);
+                return;
+            }
+        };
         // 编辑历史中的中间节点时，后继不能继续引用旧 shape；先完整试算，
         // 全部成功后再与当前节点一起提交。
         let descendant_updates = if editing_existing {
@@ -11977,7 +12361,7 @@ impl S33DApp {
                     return;
                 }
             };
-            match self.evaluate_chamfer_rebuilds(edited_id, shape, &order) {
+            match self.evaluate_chamfer_rebuilds(edited_id, shape, Some(&feature), &order) {
                 Ok(updates) => updates,
                 Err(error) => {
                     self.toast(format!("Cannot edit this operation: {error}"));
@@ -11987,27 +12371,9 @@ impl S33DApp {
         } else {
             Vec::new()
         };
-        // feature 数据（模型层类型）
-        let feature = Feature::Chamfer {
-            target,
-            base: Some(base_body),
-            edges: edge
-                .segments
-                .iter()
-                .map(|s| s33d_model::ChamferEdgeSeg {
-                    a: [s.a[0] as f64, s.a[1] as f64, s.a[2] as f64],
-                    b: [s.b[0] as f64, s.b[1] as f64, s.b[2] as f64],
-                    n1: [s.n1[0] as f64, s.n1[1] as f64, s.n1[2] as f64],
-                    n2: [s.n2[0] as f64, s.n2[1] as f64, s.n2[2] as f64],
-                })
-                .collect(),
-            reference_bounds: self
-                .kernel
-                .tessellate(base)
-                .ok()
-                .and_then(|mesh| mesh_reference_bounds(&mesh)),
-            chamfer,
-            fillet,
+        let selected_segments = match &feature {
+            Feature::Chamfer { edges, .. } => stored_chamfer_segments(edges),
+            _ => unreachable!(),
         };
         let mat = self
             .doc
@@ -12095,7 +12461,11 @@ impl S33DApp {
         self.selected = vec![result_id];
         self.record_history(format!("[sel] select body {result_id} clears regions"));
         self.clear_region_selection();
-        // 保留 selected_edge：改参数后可重新 Apply（选新边才替换）
+        // Preserve the resolved original edge when applying the same operation again.
+        self.selected_edge = Some(EdgeRef {
+            body_id: edge.body_id,
+            segments: selected_segments,
+        });
         self.hover_edge = None;
         // 保持工具激活：可连续选边连续倒角（Esc 或再点按钮退出）
         self.mesh_cache.clear();
@@ -12791,7 +13161,17 @@ impl S33DApp {
                 }
                 if self.chamfer_active {
                     // Multi-clicks already exited through the shared handler.
-                    if let Some(edge) = self.pick_edge(pos, rect) {
+                    if let Some(mut edge) = self.pick_edge(pos, rect) {
+                        if self.chamfer_fillet {
+                            if let Some(rim) = self
+                                .body(edge.body_id)
+                                .and_then(|b| b.shape)
+                                .and_then(|shape| self.pick_geometry_cache.get(&shape))
+                                .and_then(|geometry| geometry.inner_rim(edge.segments.first()?))
+                            {
+                                edge.segments = rim;
+                            }
+                        }
                         self.selected = vec![edge.body_id];
                         self.selected_edge = Some(edge);
                         self.clear_region_selection();
@@ -13380,8 +13760,15 @@ impl S33DApp {
             None
         };
         // 2. Native planar/cylindrical topology, otherwise coplanar flood.
-        let norms = mesh.face_normals();
-        let n0 = glam::Vec3::from_array(norms[hit_tri]);
+        let hit_indices = &mesh.indices[hit_tri * 3..hit_tri * 3 + 3];
+        let [a, b, c] =
+            [0, 1, 2].map(|i| glam::Vec3::from_array(mesh.positions[hit_indices[i] as usize]));
+        let normal = (b - a).cross(c - a);
+        let n0 = if normal.length_squared() > 1e-12 {
+            normal.normalize()
+        } else {
+            glam::Vec3::Y
+        };
         let native_patch = self.kernel.exact_shape(shape).and_then(|exact| {
             let &face = exact.triangle_faces.get(hit_tri)?;
             if !exact
@@ -13402,73 +13789,26 @@ impl S33DApp {
                     .collect::<Vec<_>>(),
             )
         });
-        // 顶点位置键（round 1e-3）→ 三角形列表
-        let mut vert_map: std::collections::HashMap<(i64, i64, i64), Vec<usize>> =
-            std::collections::HashMap::new();
-        for (ti, t) in mesh.indices.chunks_exact(3).enumerate() {
-            for &vi in t {
-                let p = mesh.positions[vi as usize];
-                let key = (
-                    (p[0] / 1e-3).round() as i64,
-                    (p[1] / 1e-3).round() as i64,
-                    (p[2] / 1e-3).round() as i64,
-                );
-                vert_map.entry(key).or_default().push(ti);
-            }
-        }
-        // patch 平面偏移（n · p）
-        let mut offs: Vec<f32> = Vec::with_capacity(tri_count);
-        for t in mesh.indices.chunks_exact(3) {
-            let p = glam::Vec3::from_array(mesh.positions[t[0] as usize]);
-            offs.push(n0.dot(p));
-        }
-        let o0 = offs[hit_tri];
-        let mut seen = vec![false; tri_count];
-        let mut queue = vec![hit_tri];
-        let mut patch: Vec<usize> = Vec::new();
-        if let Some(cylinder) = &cylinder {
+        let patch = if let Some(cylinder) = &cylinder {
             // A full wall can consist of several spline/half-cylinder faces.
             // The query validated their combined boundary; do not truncate it
             // back to the representative native face ID here.
-            patch = mesh
-                .indices
+            mesh.indices
                 .chunks_exact(3)
                 .enumerate()
                 .filter_map(|(i, t)| cylinder.contains_triangle(&mesh, t).then_some(i))
-                .collect();
-            queue.clear();
+                .collect()
         } else if let Some(native_patch) = native_patch {
-            patch = native_patch;
-            queue.clear();
-        }
-        while let Some(t) = queue.pop() {
-            if seen[t] {
-                continue;
+            native_patch
+        } else {
+            if !self.face_patch_cache.contains_key(&shape) && self.face_patch_cache.len() >= 8 {
+                self.face_patch_cache.clear();
             }
-            seen[t] = true;
-            let n = glam::Vec3::from_array(norms[t]);
-            let same_plane = (n.dot(n0) - 1.0).abs() < 1e-3 && (offs[t] - o0).abs() < 1e-2;
-            if !same_plane {
-                continue;
-            }
-            patch.push(t);
-            let tri = &mesh.indices[t * 3..t * 3 + 3];
-            for &vi in tri {
-                let p = mesh.positions[vi as usize];
-                let key = (
-                    (p[0] / 1e-3).round() as i64,
-                    (p[1] / 1e-3).round() as i64,
-                    (p[2] / 1e-3).round() as i64,
-                );
-                if let Some(nbrs) = vert_map.get(&key) {
-                    for &nt in nbrs {
-                        if !seen[nt] {
-                            queue.push(nt);
-                        }
-                    }
-                }
-            }
-        }
+            self.face_patch_cache
+                .entry(shape)
+                .or_insert_with(|| Arc::new(FacePatchTopology::new(&mesh)))
+                .planar_patch(&mesh, hit_tri, n0, a)
+        };
         if patch.is_empty() {
             return None;
         }
@@ -13882,6 +14222,136 @@ pub(crate) fn load_ui_fonts() -> egui::FontDefinitions {
     fonts
 }
 
+const EDGE_PICK_RADIUS: f32 = 6.0;
+const EDGE_PICK_TILE: f32 = 32.0;
+
+struct ProjectedEdge {
+    chain: usize,
+    segment: usize,
+    a: egui::Pos2,
+    b: egui::Pos2,
+}
+
+struct ProjectedEdgeIndex {
+    view_proj: glam::Mat4,
+    rect: egui::Rect,
+    edges: Vec<ProjectedEdge>,
+    tiles: HashMap<(i32, i32), Vec<usize>>,
+    long_edges: Vec<usize>,
+}
+
+impl ProjectedEdgeIndex {
+    fn tile(point: egui::Pos2) -> (i32, i32) {
+        (
+            (point.x / EDGE_PICK_TILE).floor() as i32,
+            (point.y / EDGE_PICK_TILE).floor() as i32,
+        )
+    }
+
+    fn new(chains: &[Vec<EdgeSeg>], view_proj: glam::Mat4, rect: egui::Rect) -> Self {
+        let mut index = Self {
+            view_proj,
+            rect,
+            edges: Vec::new(),
+            tiles: HashMap::new(),
+            long_edges: Vec::new(),
+        };
+        for (chain, edges) in chains.iter().enumerate() {
+            for (segment, edge) in edges.iter().enumerate() {
+                let [a, b] = [edge.a, edge.b].map(|point| {
+                    project_edge_point(&view_proj, rect, glam::Vec3::from_array(point))
+                });
+                let bounds = egui::Rect::from_two_pos(a, b)
+                    .expand(EDGE_PICK_RADIUS)
+                    .intersect(rect);
+                if bounds.is_negative() {
+                    continue;
+                }
+                let (left, top) = Self::tile(bounds.min);
+                let (right, bottom) = Self::tile(bounds.max);
+                let id = index.edges.len();
+                index.edges.push(ProjectedEdge {
+                    chain,
+                    segment,
+                    a,
+                    b,
+                });
+                // Bound the cost of long diagonal edges in a large viewport.
+                if i64::from(right - left + 1) * i64::from(bottom - top + 1) > 64 {
+                    index.long_edges.push(id);
+                    continue;
+                }
+                for y in top..=bottom {
+                    for x in left..=right {
+                        index.tiles.entry((x, y)).or_default().push(id);
+                    }
+                }
+            }
+        }
+        index
+    }
+
+    fn near(&self, pointer: egui::Pos2) -> impl Iterator<Item = &ProjectedEdge> {
+        self.tiles
+            .get(&Self::tile(pointer))
+            .into_iter()
+            .flatten()
+            .chain(&self.long_edges)
+            .map(|&id| &self.edges[id])
+    }
+}
+
+fn closest_edge_on_hit_face(
+    geometry: &PickGeometry,
+    triangle: usize,
+    view_proj: &glam::Mat4,
+    rect: egui::Rect,
+    pointer: egui::Pos2,
+) -> Option<(usize, usize, f32)> {
+    use glam::Vec3;
+    let mesh = &geometry.mesh;
+    let ids = &mesh.indices[triangle * 3..triangle * 3 + 3];
+    let [a, b, c] = [0, 1, 2].map(|i| Vec3::from_array(mesh.positions[ids[i] as usize]));
+    let normal = (b - a).cross(c - a).normalize_or_zero();
+    let incident = [(0, 1), (1, 2), (2, 0)].map(|(i, j)| {
+        let (i, j) = (ids[i] as usize, ids[j] as usize);
+        geometry.edge_to_chain.get(&(i.min(j), i.max(j))).copied()
+    });
+    let mut cache = geometry.projected_edges.lock().unwrap();
+    if cache
+        .as_ref()
+        .is_none_or(|index| index.view_proj != *view_proj || index.rect != rect)
+    {
+        *cache = Some(ProjectedEdgeIndex::new(&geometry.chains, *view_proj, rect));
+    }
+    let index = cache.as_ref().unwrap();
+    let mut best = None;
+    for projected in index.near(pointer) {
+        let distance = distance_to_projected_edge(pointer, projected.a, projected.b);
+        if distance >= EDGE_PICK_RADIUS {
+            continue;
+        }
+        let incident = incident.contains(&Some(projected.chain));
+        let edge = &geometry.chains[projected.chain][projected.segment];
+        // Booleans can retriangulate the cap between the cursor and the
+        // boundary. Keep nearby coplanar edges eligible.
+        if incident
+            || ([edge.n1, edge.n2]
+                .into_iter()
+                .any(|n| Vec3::from_array(n).dot(normal) > 0.9999)
+                && [edge.a, edge.b]
+                    .into_iter()
+                    .all(|p| (Vec3::from_array(p) - a).dot(normal).abs() < 1e-3))
+        {
+            let candidate = (distance, !incident, projected.chain, projected.segment);
+            if best.is_none_or(|previous| candidate < previous) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best.map(|(distance, _, chain, segment)| (chain, segment, distance))
+}
+
 /// 一条世界空间线段投影到屏幕后，与鼠标位置的最近距离（像素）。
 fn edge_screen_dist(
     view_proj: &glam::Mat4,
@@ -13890,19 +14360,26 @@ fn edge_screen_dist(
     a: glam::Vec3,
     b: glam::Vec3,
 ) -> f32 {
-    let project = |p: glam::Vec3| -> egui::Pos2 {
-        let clip = *view_proj * p.extend(1.0);
-        if clip.w <= 1e-6 {
-            return egui::pos2(-1e9, -1e9);
-        }
-        let ndc = clip.truncate() / clip.w;
-        egui::pos2(
-            rect.left() + (ndc.x + 1.0) * 0.5 * rect.width(),
-            rect.top() + (1.0 - ndc.y) * 0.5 * rect.height(),
-        )
-    };
-    let pa = project(a);
-    let pb = project(b);
+    distance_to_projected_edge(
+        mouse,
+        project_edge_point(view_proj, rect, a),
+        project_edge_point(view_proj, rect, b),
+    )
+}
+
+fn project_edge_point(view_proj: &glam::Mat4, rect: egui::Rect, point: glam::Vec3) -> egui::Pos2 {
+    let clip = *view_proj * point.extend(1.0);
+    if clip.w <= 1e-6 {
+        return egui::pos2(-1e9, -1e9);
+    }
+    let ndc = clip.truncate() / clip.w;
+    egui::pos2(
+        rect.left() + (ndc.x + 1.0) * 0.5 * rect.width(),
+        rect.top() + (1.0 - ndc.y) * 0.5 * rect.height(),
+    )
+}
+
+fn distance_to_projected_edge(mouse: egui::Pos2, pa: egui::Pos2, pb: egui::Pos2) -> f32 {
     let ab = pb - pa;
     let l2 = ab.length_sq();
     let t = if l2 > 1e-9 {
@@ -13916,6 +14393,76 @@ fn edge_screen_dist(
 
 type FaceVertexKey = (i64, i64, i64);
 type FaceEdgeKey = (FaceVertexKey, FaceVertexKey);
+
+struct FacePatchTopology {
+    normals: Vec<[f32; 3]>,
+    vertex_groups: Vec<usize>,
+    triangles_by_vertex: Vec<Vec<usize>>,
+}
+
+impl FacePatchTopology {
+    fn new(mesh: &MeshData) -> Self {
+        let mut groups = HashMap::new();
+        let vertex_groups: Vec<_> = mesh
+            .positions
+            .iter()
+            .map(|position| {
+                let key = position.map(|value| (value / 1e-3).round() as i64);
+                let next = groups.len();
+                *groups.entry(key).or_insert(next)
+            })
+            .collect();
+        let mut triangles_by_vertex = vec![Vec::new(); groups.len()];
+        for (triangle, vertices) in mesh.indices.chunks_exact(3).enumerate() {
+            for &vertex in vertices {
+                triangles_by_vertex[vertex_groups[vertex as usize]].push(triangle);
+            }
+        }
+        Self {
+            normals: mesh.face_normals(),
+            vertex_groups,
+            triangles_by_vertex,
+        }
+    }
+
+    fn planar_patch(
+        &self,
+        mesh: &MeshData,
+        seed: usize,
+        normal: glam::Vec3,
+        origin: glam::Vec3,
+    ) -> Vec<usize> {
+        let mut visited = vec![false; self.normals.len()];
+        let mut visited_vertices = vec![false; self.triangles_by_vertex.len()];
+        let mut queue = vec![seed];
+        let mut patch = Vec::new();
+        let offset = normal.dot(origin);
+        while let Some(id) = queue.pop() {
+            if std::mem::replace(&mut visited[id], true) {
+                continue;
+            }
+            let indices = &mesh.indices[id * 3..id * 3 + 3];
+            let n = glam::Vec3::from_array(self.normals[id]);
+            let point = glam::Vec3::from_array(mesh.positions[indices[0] as usize]);
+            if (n.dot(normal) - 1.).abs() >= 1e-3 || (normal.dot(point) - offset).abs() >= 1e-2 {
+                continue;
+            }
+            patch.push(id);
+            for &vertex in indices {
+                let group = self.vertex_groups[vertex as usize];
+                if !std::mem::replace(&mut visited_vertices[group], true) {
+                    queue.extend(
+                        self.triangles_by_vertex[group]
+                            .iter()
+                            .copied()
+                            .filter(|&id| !visited[id]),
+                    );
+                }
+            }
+        }
+        patch
+    }
+}
 
 fn quantized_face_vertex(point: [f32; 3]) -> FaceVertexKey {
     const SCALE: f32 = 1_000.0;
@@ -15099,6 +15646,120 @@ fn stored_chamfer_segments(edges: &[s33d_model::ChamferEdgeSeg]) -> Vec<EdgeSeg>
         .collect()
 }
 
+fn matches_original_chamfer_edge(edge: &EdgeSeg, original: &EdgeSeg) -> bool {
+    use glam::DVec3;
+    let as_vec = |p: [f32; 3]| DVec3::from_array(p.map(f64::from));
+    let (n1, n2) = (as_vec(edge.n1), as_vec(edge.n2));
+    let (m1, m2) = (as_vec(original.n1), as_vec(original.n2));
+    if !((n1.dot(m1) > 0.999 && n2.dot(m2) > 0.999) || (n1.dot(m2) > 0.999 && n2.dot(m1) > 0.999)) {
+        return false;
+    }
+    let origin = as_vec(original.a);
+    let along = as_vec(original.b) - origin;
+    let length = along.length();
+    if length < 1e-5 {
+        return false;
+    }
+    let direction = along / length;
+    let tolerance = (length * 2e-6).max(1e-3);
+    [edge.a, edge.b].into_iter().all(|point| {
+        let delta = as_vec(point) - origin;
+        let position = delta.dot(direction);
+        position >= -tolerance
+            && position <= length + tolerance
+            && (delta - direction * position).length() <= tolerance
+    })
+}
+
+fn polygon_chamfer_rim_indices(rim: &[EdgeSeg], segments: &[EdgeSeg]) -> Option<Vec<usize>> {
+    let mut indices = segments
+        .iter()
+        .map(|segment| {
+            rim.iter()
+                .position(|edge| matches_original_chamfer_edge(segment, edge))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    indices.sort_unstable();
+    indices.dedup();
+    (!indices.is_empty()).then_some(indices)
+}
+
+fn recover_polygon_chamfer_sides(
+    rim: &[EdgeSeg],
+    segments: &[EdgeSeg],
+    distance: f64,
+) -> Option<Vec<usize>> {
+    use glam::Vec3;
+    if let Some(indices) = polygon_chamfer_rim_indices(rim, segments) {
+        return Some(indices);
+    }
+    if distance <= 0.0 {
+        return None;
+    }
+    let (original, caps): (Vec<_>, Vec<_>) = segments.iter().cloned().partition(|segment| {
+        rim.iter()
+            .any(|edge| matches_original_chamfer_edge(segment, edge))
+    });
+    // Old projects may have recorded a short end cap in the same chain as
+    // the original side. Only discard connected fragments in the rim plane.
+    let indices = polygon_chamfer_rim_indices(rim, &original)?;
+    let [a, b, c] = [0, 1, 2].map(|i| Vec3::from_array(rim[i].a));
+    let normal = (b - a).cross(c - a).normalize_or_zero();
+    if normal == Vec3::ZERO {
+        return None;
+    }
+    let cap_limit = (2.0 * distance + 0.25) as f32;
+    let are_end_caps = caps.iter().all(|cap| {
+        let tips = [cap.a, cap.b].map(Vec3::from_array);
+        tips[0].distance(tips[1]) <= cap_limit
+            && tips.iter().all(|p| (*p - a).dot(normal).abs() < 1e-3)
+            && original.iter().any(|edge| {
+                [edge.a, edge.b]
+                    .into_iter()
+                    .map(Vec3::from_array)
+                    .any(|p| tips.iter().any(|tip| tip.distance_squared(p) < 1e-6))
+            })
+    });
+    are_end_caps.then_some(indices)
+}
+
+fn find_polygon_chamfer_rim(
+    geometry: &PickGeometry,
+    segments: &[EdgeSeg],
+    distance: f64,
+) -> Option<(Vec<EdgeSeg>, Vec<usize>)> {
+    use glam::Vec3;
+    let seed = segments.iter().find_map(|segment| {
+        geometry
+            .chains
+            .iter()
+            .flatten()
+            .find(|edge| matches_original_chamfer_edge(segment, edge))
+    })?;
+    let rim = geometry.inner_rim(seed)?;
+    let orthogonal = |edge: &EdgeSeg| {
+        Vec3::from_array(edge.n1)
+            .dot(Vec3::from_array(edge.n2))
+            .abs()
+            < 1e-3
+    };
+    if !rim.iter().all(orthogonal)
+        || is_reentrant_edge(
+            &geometry.mesh,
+            &EdgeCutterSegment {
+                a: seed.a.map(f64::from),
+                b: seed.b.map(f64::from),
+                n1: seed.n1.map(f64::from),
+                n2: seed.n2.map(f64::from),
+            },
+        )
+    {
+        return None;
+    }
+    let picked = recover_polygon_chamfer_sides(&rim, segments, distance)?;
+    Some((rim, picked))
+}
+
 fn model_chamfer_segments(segments: &[EdgeSeg]) -> Vec<s33d_model::ChamferEdgeSeg> {
     segments
         .iter()
@@ -15124,48 +15785,40 @@ fn mesh_reference_bounds(mesh: &MeshData) -> Option<[[f64; 3]; 2]> {
     Some([min, max])
 }
 
+#[cfg(test)]
 fn mesh_sharp_edge_segments(mesh: &MeshData) -> Vec<Vec<EdgeSeg>> {
-    let mut mesh = mesh.clone();
-    mesh.weld(1e-5);
-    let chains = mesh.sharp_edge_chains(25.0, 20.0);
-    chains
-        .into_iter()
-        .filter_map(|chain| {
-            let mut segments = Vec::with_capacity(chain.len());
-            for (edge_a, edge_b) in chain {
-                let key = if edge_a < edge_b {
-                    (edge_a, edge_b)
-                } else {
-                    (edge_b, edge_a)
-                };
-                let mut normals = Vec::with_capacity(2);
-                for triangle in mesh.indices.chunks_exact(3) {
-                    if !(triangle.contains(&(key.0 as u32)) && triangle.contains(&(key.1 as u32))) {
-                        continue;
-                    }
-                    let a = glam::Vec3::from_array(mesh.positions[triangle[0] as usize]);
-                    let b = glam::Vec3::from_array(mesh.positions[triangle[1] as usize]);
-                    let c = glam::Vec3::from_array(mesh.positions[triangle[2] as usize]);
-                    let normal = (b - a).cross(c - a);
-                    if normal.length_squared() > 1e-12 {
-                        normals.push(normal.normalize());
-                    }
-                    if normals.len() == 2 {
-                        break;
-                    }
-                }
-                if normals.len() == 2 {
-                    segments.push(EdgeSeg {
-                        a: mesh.positions[key.0],
-                        b: mesh.positions[key.1],
-                        n1: normals[0].to_array(),
-                        n2: normals[1].to_array(),
-                    });
-                }
+    PickGeometry::new(mesh.clone()).chains
+}
+
+fn is_reentrant_edge(mesh: &MeshData, edge: &EdgeCutterSegment) -> bool {
+    use glam::DVec3;
+    let a = DVec3::from_array(edge.a);
+    let b = DVec3::from_array(edge.b);
+    let n1 = DVec3::from_array(edge.n1);
+    let n2 = DVec3::from_array(edge.n2);
+    mesh.indices
+        .chunks_exact(3)
+        .find_map(|triangle| {
+            let points = [0, 1, 2]
+                .map(|i| DVec3::from_array(mesh.positions[triangle[i] as usize].map(f64::from)));
+            let i = points.iter().position(|p| p.distance_squared(a) < 1e-8)?;
+            let j = points.iter().position(|p| p.distance_squared(b) < 1e-8)?;
+            if i == j {
+                return None;
             }
-            (!segments.is_empty()).then_some(segments)
+            let normal = (points[1] - points[0])
+                .cross(points[2] - points[0])
+                .normalize_or_zero();
+            let other = if normal.dot(n1) > 0.995 {
+                n2
+            } else if normal.dot(n2) > 0.995 {
+                n1
+            } else {
+                return None;
+            };
+            Some((points[3 - i - j] - a).dot(other) > 1e-6)
         })
-        .collect()
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Copy)]
@@ -15230,8 +15883,20 @@ fn remap_chamfer_segments(
 ) -> Option<Vec<EdgeSeg>> {
     let stored_signature = edge_chain_signature(stored, reference_bounds)?;
     let current_bounds = mesh_reference_bounds(mesh)?;
-    mesh_sharp_edge_segments(mesh)
-        .into_iter()
+    let geometry = PickGeometry::new(mesh.clone());
+    geometry
+        .chains
+        .iter()
+        .filter(|chain| !chain.is_empty())
+        .map(|chain| {
+            if stored_signature.closed {
+                geometry
+                    .inner_rim(&chain[0])
+                    .unwrap_or_else(|| chain.clone())
+            } else {
+                chain.clone()
+            }
+        })
         .filter_map(|candidate| {
             let signature = edge_chain_signature(&candidate, current_bounds)?;
             if signature.closed != stored_signature.closed {
@@ -18116,6 +18781,108 @@ mod gizmo_tests {
     }
 
     #[test]
+    fn polygon_hole_rounds_interior_corner_and_chamfers_the_complete_upper_rim() {
+        let ctx = egui::Context::default();
+        let mut app = S33DApp::new(&eframe::CreationContext::_new_kittest(ctx));
+        let region = Region2D {
+            outer: vec![[-7.0, -7.0], [7.0, -7.0], [7.0, 7.0], [-7.0, 7.0]],
+            holes: vec![vec![[-2.0, -2.0], [-2.0, 2.0], [2.0, 2.0], [2.0, -2.0]]],
+        };
+        let source = app
+            .kernel
+            .extrude_region(&region, &DatumPlane::Front.def(), 8.0)
+            .unwrap();
+        let original = app.kernel.tessellate(source).unwrap();
+        let volume = |mesh| crate::ui::mesh_surface_area_and_volume(mesh).1;
+        let geometry = PickGeometry::new(original.clone());
+        let near_hole = |point: [f32; 3]| point[0].abs() < 3.0 && point[1].abs() < 3.0;
+        let inner_edges = geometry
+            .chains
+            .iter()
+            .flatten()
+            .filter(|edge| near_hole(edge.a) && near_hole(edge.b))
+            .collect::<Vec<_>>();
+        let corner = inner_edges
+            .iter()
+            .copied()
+            .find(|edge| (edge.a[2] - edge.b[2]).abs() > 7.0)
+            .unwrap();
+        let (rounded, _) = app
+            .evaluate_chamfer_feature(source, std::slice::from_ref(corner), None, Some(0.8))
+            .unwrap();
+        let rounded = app.kernel.tessellate(rounded).unwrap();
+        assert!(volume(&rounded) > volume(&original) + 0.5);
+        assert_eq!(rounded.bounds(), original.bounds());
+
+        let upper_edge = inner_edges
+            .iter()
+            .copied()
+            .find(|edge| edge.a[2] > 7.0 && edge.b[2] > 7.0)
+            .unwrap();
+        let rim = geometry
+            .inner_rim(upper_edge)
+            .expect("clicking one side selects the whole rim");
+        assert_eq!(rim.len(), 4);
+        let (chamfered, count) = app
+            .evaluate_chamfer_feature(source, &rim, Some(0.8), None)
+            .unwrap();
+        assert_eq!(count, 4);
+        let chamfered = app.kernel.tessellate(chamfered).unwrap();
+        assert!((volume(&original) - volume(&chamfered) - 5.8).abs() < 0.25);
+        assert_eq!(chamfered.bounds(), original.bounds());
+
+        let plate = app
+            .kernel
+            .extrude_region(&Region2D::new(region.outer), &DatumPlane::Front.def(), 8.0)
+            .unwrap();
+        let pocket_plane = PlaneDef {
+            origin: [0.0, 0.0, 4.0],
+            ..DatumPlane::Front.def()
+        };
+        let pocket_tool = app
+            .kernel
+            .extrude_region(
+                &Region2D::new(
+                    region
+                        .holes
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                        .into_iter()
+                        .rev()
+                        .collect(),
+                ),
+                &pocket_plane,
+                5.0,
+            )
+            .unwrap();
+        let pocket = app.kernel.boolean_subtract(plate, pocket_tool).unwrap();
+        let pocket_mesh = app.kernel.tessellate(pocket).unwrap();
+        let geometry = PickGeometry::new(pocket_mesh.clone());
+        let floor_edge = geometry
+            .chains
+            .iter()
+            .flatten()
+            .find(|edge| {
+                near_hole(edge.a)
+                    && near_hole(edge.b)
+                    && (edge.a[2] - 4.0).abs() < 1e-5
+                    && (edge.b[2] - 4.0).abs() < 1e-5
+            })
+            .unwrap();
+        let floor_rim = geometry
+            .inner_rim(floor_edge)
+            .expect("the pocket floor has a closed rim");
+        assert_eq!(floor_rim.len(), 4);
+        let (rounded, _) = app
+            .evaluate_chamfer_feature(pocket, &floor_rim, None, Some(0.65))
+            .unwrap();
+        let rounded = app.kernel.tessellate(rounded).unwrap();
+        assert!(volume(&rounded) > volume(&pocket_mesh) + 0.5);
+        assert_eq!(rounded.bounds(), pocket_mesh.bounds());
+    }
+
+    #[test]
     fn chamfer_edge_signature_resolves_after_base_dimensions_change() {
         let mut kernel = TruckKernel::new();
         let plane = PlaneDef::from_normal([0.0, 0.0, 1.0]);
@@ -18136,7 +18903,8 @@ mod gizmo_tests {
         let old_mesh = kernel.tessellate(old_shape).unwrap();
         let new_mesh = kernel.tessellate(new_shape).unwrap();
         let old_bounds = mesh_reference_bounds(&old_mesh).unwrap();
-        let stored = mesh_sharp_edge_segments(&old_mesh)
+        let stored = PickGeometry::new(old_mesh)
+            .chains
             .into_iter()
             .next()
             .expect("box must expose at least one sharp chain");
@@ -19640,7 +20408,7 @@ mod gizmo_tests {
             .unwrap();
         let base = app.body(38).unwrap().shape.unwrap();
         let mesh = app.kernel.tessellate(base).unwrap();
-        let chains = mesh_sharp_edge_segments(&mesh);
+        let chains = PickGeometry::new(mesh).chains;
         eprintln!(
             "helmet chains: {:?}",
             chains.iter().map(|c| c.len()).collect::<Vec<_>>()
@@ -20450,60 +21218,134 @@ fn append_solid_world_segment_width(
 
 /// Sketch 参考实体的工程图式棱线：面向相机或构成轮廓的边为实线，
 /// 两侧面都背向相机的边为虚线。开放网格的边界边也作为参考边保留。
+struct SketchMarkerProjection {
+    view_proj: glam::Mat4,
+    rect: egui::Rect,
+    markers: Vec<((i32, i32), glam::Vec3)>,
+}
+
+impl SketchMarkerProjection {
+    fn cell(point: egui::Pos2) -> (i32, i32) {
+        ((point.x / 8.).floor() as i32, (point.y / 8.).floor() as i32)
+    }
+
+    fn new(
+        view_proj: glam::Mat4,
+        rect: egui::Rect,
+        points: impl Iterator<Item = glam::Vec3>,
+    ) -> Self {
+        let mut cells = HashSet::new();
+        // Keep all snap points in SketchSession, with at most one visible
+        // reference marker per screen cell.
+        let markers = points
+            .filter_map(|world| {
+                let screen = project_edge_point(&view_proj, rect, world);
+                let cell = Self::cell(screen);
+                (rect.contains(screen) && cells.insert(cell)).then_some((cell, world))
+            })
+            .collect();
+        Self {
+            view_proj,
+            rect,
+            markers,
+        }
+    }
+}
+
+struct SketchReferenceEdge {
+    a: glam::Vec3,
+    b: glam::Vec3,
+    normals: Vec<glam::Vec3>,
+}
+
+struct SketchReferenceGeometry {
+    edges: Vec<SketchReferenceEdge>,
+    eye: Option<glam::Vec3>,
+    visible: Vec<[f32; 3]>,
+    hidden: Vec<[f32; 3]>,
+}
+
+impl SketchReferenceGeometry {
+    fn new(mut mesh: MeshData, min_angle_deg: f32) -> Self {
+        use glam::Vec3;
+        // A display mesh can split the same vertex many times for normals.
+        // Reconnect those seams before testing which edges belong in Sketch.
+        mesh.weld(1e-5);
+        let mut normals = Vec::with_capacity(mesh.triangle_count());
+        let mut incident = Vec::with_capacity(mesh.indices.len());
+        for triangle in mesh.indices.chunks_exact(3) {
+            let [a, b, c] =
+                [0, 1, 2].map(|i| Vec3::from_array(mesh.positions[triangle[i] as usize]));
+            let normal = (b - a).cross(c - a).normalize_or_zero();
+            if normal.length_squared() <= 1e-10 {
+                continue;
+            }
+            let id = normals.len();
+            normals.push(normal);
+            for (left, right) in [(0, 1), (1, 2), (2, 0)] {
+                let (a, b) = (triangle[left], triangle[right]);
+                incident.push(((a.min(b), a.max(b)), id));
+            }
+        }
+        incident.sort_unstable_by_key(|&(edge, _)| edge);
+        let cosine = min_angle_deg.to_radians().cos();
+        let mut edges = Vec::new();
+        for uses in incident.chunk_by(|left, right| left.0 == right.0) {
+            let feature = uses.len() == 1
+                || uses.iter().enumerate().any(|(i, &(_, left))| {
+                    uses[i + 1..]
+                        .iter()
+                        .any(|&(_, right)| normals[left].dot(normals[right]) < cosine)
+                });
+            if feature {
+                let ((a, b), _) = uses[0];
+                edges.push(SketchReferenceEdge {
+                    a: Vec3::from_array(mesh.positions[a as usize]),
+                    b: Vec3::from_array(mesh.positions[b as usize]),
+                    normals: uses.iter().map(|&(_, index)| normals[index]).collect(),
+                });
+            }
+        }
+        Self {
+            edges,
+            eye: None,
+            visible: Vec::new(),
+            hidden: Vec::new(),
+        }
+    }
+
+    fn lines(&mut self, camera_eye: glam::Vec3) -> (&[[f32; 3]], &[[f32; 3]]) {
+        if self.eye != Some(camera_eye) {
+            self.eye = Some(camera_eye);
+            self.visible.clear();
+            self.hidden.clear();
+            for edge in &self.edges {
+                let toward_camera = (camera_eye - (edge.a + edge.b) * 0.5).normalize_or_zero();
+                if edge
+                    .normals
+                    .iter()
+                    .any(|normal| normal.dot(toward_camera) > 0.01)
+                {
+                    self.visible
+                        .extend_from_slice(&[edge.a.to_array(), edge.b.to_array()]);
+                } else {
+                    append_dashed_world_segment(&mut self.hidden, edge.a, edge.b);
+                }
+            }
+        }
+        (&self.visible, &self.hidden)
+    }
+}
+
+#[cfg(test)]
 fn sketch_reference_edges(
     mesh: &MeshData,
     camera_eye: glam::Vec3,
     min_angle_deg: f32,
 ) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
-    use std::collections::HashMap;
-
-    let cos_threshold = min_angle_deg.to_radians().cos();
-    let mut edge_faces: HashMap<(u32, u32), Vec<glam::Vec3>> = HashMap::new();
-    for triangle in mesh.indices.chunks_exact(3) {
-        let a = glam::Vec3::from_array(mesh.positions[triangle[0] as usize]);
-        let b = glam::Vec3::from_array(mesh.positions[triangle[1] as usize]);
-        let c = glam::Vec3::from_array(mesh.positions[triangle[2] as usize]);
-        let normal = (b - a).cross(c - a).normalize_or_zero();
-        if normal.length_squared() <= 1e-10 {
-            continue;
-        }
-        for (left, right) in [(0usize, 1usize), (1, 2), (2, 0)] {
-            let edge = if triangle[left] < triangle[right] {
-                (triangle[left], triangle[right])
-            } else {
-                (triangle[right], triangle[left])
-            };
-            edge_faces.entry(edge).or_default().push(normal);
-        }
-    }
-
-    let mut visible = Vec::new();
-    let mut hidden = Vec::new();
-    for ((a_index, b_index), normals) in edge_faces {
-        let feature_edge = normals.len() == 1
-            || normals.iter().enumerate().any(|(i, left)| {
-                normals
-                    .iter()
-                    .skip(i + 1)
-                    .any(|right| left.dot(*right) < cos_threshold)
-            });
-        if !feature_edge {
-            continue;
-        }
-        let a = glam::Vec3::from_array(mesh.positions[a_index as usize]);
-        let b = glam::Vec3::from_array(mesh.positions[b_index as usize]);
-        let midpoint = (a + b) * 0.5;
-        let toward_camera = (camera_eye - midpoint).normalize_or_zero();
-        let faces_camera = normals
-            .iter()
-            .any(|normal| normal.dot(toward_camera) > 0.01);
-        if faces_camera {
-            visible.extend_from_slice(&[a.to_array(), b.to_array()]);
-        } else {
-            append_dashed_world_segment(&mut hidden, a, b);
-        }
-    }
-    (visible, hidden)
+    let mut reference = SketchReferenceGeometry::new(mesh.clone(), min_angle_deg);
+    let (visible, hidden) = reference.lines(camera_eye);
+    (visible.to_vec(), hidden.to_vec())
 }
 
 /// 以两个相邻、关于轴线对称的 1 px stroke 模拟稳定的 2 号线宽。

@@ -5,7 +5,49 @@ mod identity;
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(s33d_brand_icon)");
-    println!("cargo:rerun-if-changed=src/identity.rs");
+    for path in [
+        "src",
+        "../kernel",
+        "../model",
+        "../../Docs/UserManual.en.md",
+        "../../Docs/UserManual.zh-CN.md",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    println!("cargo:rerun-if-env-changed=S33D_BUILD_ID");
+    let build_id = env::var("S33D_BUILD_ID").unwrap_or_else(|_| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string()
+    });
+    assert!(
+        !build_id.is_empty()
+            && build_id.len() <= 32
+            && build_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        "Invalid S33D_BUILD_ID"
+    );
+    println!("cargo:rustc-env=S33D_BUILD_ID={build_id}");
+    for (name, fallback) in [
+        ("S33D_BUILD_TIME", "development"),
+        ("S33D_BUILD_CHANNEL", "development"),
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+        let value = env::var(name).unwrap_or_else(|_| fallback.to_owned());
+        assert!(
+            !value.is_empty()
+                && value.len() <= 40
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-: .TZ".contains(&b)),
+            "Invalid build metadata"
+        );
+        println!("cargo:rustc-env={name}={value}");
+    }
+
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let icons = manifest.join("../../assets/icons");
     let png = icons.join("s33d-sprouted.png");
@@ -31,10 +73,10 @@ fn main() {
         env!("CARGO_PKG_VERSION_MINOR"),
         env!("CARGO_PKG_VERSION_PATCH")
     );
-    let flags = if env!("CARGO_PKG_VERSION_PRE").is_empty() {
+    let flags = 8 | if env!("CARGO_PKG_VERSION_PRE").is_empty() {
         0
     } else {
-        2 // VS_FF_PRERELEASE
+        2
     };
     let resource_text = format!(
         r#"#pragma code_page(65001)
@@ -60,6 +102,7 @@ BEGIN
             VALUE "OriginalFilename", "s33d-app.exe\0"
             VALUE "ProductName", "{product}\0"
             VALUE "ProductVersion", "{version}\0"
+            VALUE "PrivateBuild", "{build_id}\0"
             VALUE "Comments", "Project license: {license}. Third-party licenses are provided separately.\0"
         END
     END

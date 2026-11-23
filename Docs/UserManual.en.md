@@ -60,8 +60,9 @@ This guide covers the main S33D workflows. Use the search box at the top of the 
 - The modeling toolbar is on the left and contains Sketch, Draw 3D, Extrude, Boolean, Mirror, and other commands.
 - The 3D workspace is in the center. Use it to inspect geometry, select edges, surfaces, or objects, and manipulate the gizmo.
 - View, Properties, Beginner Guide, and History are on the right.
-- The floating Objects window manages selection, visibility, names, colors, and deletion.
+- The floating Objects window manages selection, visibility, names, colors, and deletion. Drag its title bar to reposition it and scroll inside the list to reach more objects.
 - The status bar shows the current hint, unit, step size, and snap state.
+- The window title and Help > About S33D show the build number. The Windows installer filename includes the same number.
 
 ## 2. Selection
 
@@ -197,6 +198,7 @@ Model export suggests the current project name and defaults to STEP (`.step`). S
 - Apply changes the solid immediately. Reapply different parameters on the same edge to update that feature. Applying on another edge keeps the previous operation and builds the next feature on its result, without requiring Done first.
 - Done manually finishes the current edge and keeps the tool open. Exit Chamfer/Fillet applies the latest parameters, finishes the edge, and collapses the tool menus. Double-clicking a face or triple-clicking an object also exits and performs that selection.
 - Select a feature again in Objects to edit its parameters. Deleting a middle feature rebuilds its later dependents.
+- For a straight-walled polygonal hole, click a side of the opening and choose Apply. Continue around the rim using the same Distance to join the adjacent chamfers, including the last side back to the first. If the offset sides cross, reduce Distance. To rebuild a saved run of equal-width chamfers, select its last feature in Objects and apply the original Distance again.
 
 ## 15. Array, Copy, Paste, and Delete
 
@@ -234,7 +236,7 @@ Model export suggests the current project name and defaults to STEP (`.step`). S
 - Gear Generator, Tire Generator, Wheel Rim Generator, and Surface Texture are optional built-in tools enabled from Plug-ins.
 - Tire Generator creates Highway Rib, Block, Chevron, or All-Terrain tires from outer diameter, rim diameter, section width, tread depth, and repeat count.
 - Wheel Rim Generator creates Five Spoke, Six Spoke, Split Five Spoke, or Multi-Spoke rims with editable hub, center bore, and bolt-pattern dimensions.
-- Surface Texture requires a selected planar face or a parametric cylinder side. It creates straight, left/right diagonal, or diamond knurling with editable pitch, width, depth, angle, and margin.
+- Select a planar face or a complete cylindrical wall, including the inside of a bore, to apply Surface Texture. It creates straight, left/right diagonal, or diamond knurling with editable pitch, width, depth, angle, and margin. On a cylinder, the spacing adjusts to fit a whole number of grooves around the circumference.
 - Generated objects retain their parameters. Select one and reopen its plug-in to update it without changing its Object identity. Surface Texture keeps its source Object hidden as a non-destructive dependency.
 
 ## 19. Settings and Beginner Mode
@@ -496,3 +498,6 @@ Importing photos into S33D is optional project reference storage or an alternate
 The switch at the top right of the 3D workspace shows or hides the auxiliary grid and RGB reference axes together. The View menu uses the same switch. Settings > Re-enable all hidden tips also restores both guides. This changes the display only; model geometry, snapping and the orientation gizmo are unaffected. The existing grid visibility is saved with the project.
 
 File > Open Recent lists up to ten recently opened or successfully saved projects, newest first. Hover over a project name to see its full path. Select it to open directly; unsaved changes still offer Save, Discard or Cancel. The list is kept in your local preferences across restarts. Failed or missing projects leave the current document and list intact; locate a moved file through Open Project to update its entry.
+
+
+The title bar and Help > About S33D show the build identifier. About also shows UTC build time and installation channel, with Copy version information for support. The installer filename carries the same identifier.

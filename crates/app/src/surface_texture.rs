@@ -3,8 +3,8 @@
 //! The operation is intentionally non-destructive at document level: the
 //! source body remains in the model tree (hidden), while this module cuts a
 //! generated set of shallow grooves into a new result shape.  Planar patches
-//! use clipped straight grooves. Cylinders use tangent cutters distributed
-//! around the complete continuous side surface.
+//! use clipped straight grooves. Cylindrical cuts have a periodic angular
+//! pitch and preserve the source beyond the selected band.
 
 use glam::DVec3;
 use s33d_kernel::{GeometryKernel, MeshData, ShapeId, TruckKernel};
@@ -54,7 +54,11 @@ pub fn validate(
             length,
             ..
         } => {
-            if *radius <= params.depth || *length <= params.margin * 2.0 + params.pitch {
+            if !radius.is_finite()
+                || !length.is_finite()
+                || *radius <= params.depth
+                || *length <= params.margin * 2.0 + params.pitch
+            {
                 return Err(
                     "Selected cylinder is too small for this depth, pitch and margin".into(),
                 );
@@ -68,7 +72,9 @@ pub fn validate(
 fn validate_basis(axis: [f64; 3], x_axis: [f64; 3]) -> Result<(), String> {
     let axis = DVec3::from_array(axis);
     let x_axis = DVec3::from_array(x_axis);
-    if axis.length_squared() < 0.99
+    if !axis.is_finite()
+        || !x_axis.is_finite()
+        || axis.length_squared() < 0.99
         || x_axis.length_squared() < 0.99
         || axis.dot(x_axis).abs() > 0.02
     {
@@ -85,17 +91,36 @@ pub fn build_surface_texture_shape(
     params: &SurfaceTextureParams,
 ) -> Result<ShapeId, String> {
     validate(surface, params)?;
-    if matches!(surface, SurfaceTextureSurface::Cylinder { .. }) {
-        return Ok(kernel.insert_mesh(textured_cylinder_mesh(surface, params)?));
+    let mut cutter_meshes = match surface {
+        SurfaceTextureSurface::Planar { .. } => planar_cutters(surface, params)?,
+        SurfaceTextureSurface::Cylinder { .. } => cylindrical_cutters(surface, params)?,
+    };
+    if matches!(surface, SurfaceTextureSurface::Cylinder { .. }) && cutter_meshes.len() == 2 {
+        // Merge the two hands before cutting the wall. Cutting them in
+        // sequence can leave degenerate triangles at their intersections.
+        let right = kernel.insert_mesh(cutter_meshes.pop().unwrap());
+        let left = kernel.insert_mesh(cutter_meshes.pop().unwrap());
+        let combined = kernel.boolean_union(left, right);
+        kernel.delete(left);
+        kernel.delete(right);
+        let combined =
+            combined.map_err(|error| format!("Could not join diamond grooves: {error}"))?;
+        let result = kernel.boolean_subtract(source, combined);
+        kernel.delete(combined);
+        return result.map_err(|error| format!("Could not cut diamond grooves: {error}"));
     }
-    let cutter_meshes = planar_cutters(surface, params)?;
     let mut result = source;
     for (index, cutters) in cutter_meshes.into_iter().enumerate() {
         if cutters.is_empty() {
             continue;
         }
         let cutter = kernel.insert_mesh(cutters);
-        result = kernel.boolean_subtract(result, cutter).map_err(|error| {
+        let next = kernel.boolean_subtract(result, cutter);
+        kernel.delete(cutter);
+        if result != source {
+            kernel.delete(result);
+        }
+        result = next.map_err(|error| {
             format!(
                 "Could not cut surface-texture groove {}: {error}",
                 index + 1
@@ -203,93 +228,104 @@ fn line_rectangle_interval(
     (end > start + 1.0e-6).then_some((start, end))
 }
 
-fn textured_cylinder_mesh(
+fn cylindrical_cutters(
     surface: &SurfaceTextureSurface,
     params: &SurfaceTextureParams,
-) -> Result<MeshData, String> {
+) -> Result<Vec<MeshData>, String> {
     let SurfaceTextureSurface::Cylinder {
         center,
         axis,
         x_axis,
         radius,
         length,
-    } = surface
+        internal,
+    } = *surface
     else {
         unreachable!()
     };
-    let center = DVec3::from_array(*center);
-    let axis = DVec3::from_array(*axis).normalize();
-    let x_axis = DVec3::from_array(*x_axis).normalize();
-    let z_axis = axis.cross(x_axis).normalize();
-    let usable_length = length - params.margin * 2.0;
+    let center = DVec3::from_array(center);
+    let axis = DVec3::from_array(axis).normalize();
+    let x = (DVec3::from_array(x_axis) - axis * axis.dot(DVec3::from_array(x_axis))).normalize();
+    let y = axis.cross(x);
+    let half_length = length * 0.5 - params.margin;
     let circumference = std::f64::consts::TAU * radius;
-    let around = ((circumference / params.pitch) * 12.0)
-        .ceil()
-        .clamp(96.0, 960.0) as usize;
-    let along = ((length / params.pitch) * 10.0).ceil().clamp(12.0, 320.0) as usize;
-    let mut positions = Vec::with_capacity((along + 1) * around + 2);
-    for axial_index in 0..=along {
-        let t = axial_index as f64 / along as f64;
-        let axial_offset = (t - 0.5) * length;
-        for around_index in 0..around {
-            let theta = std::f64::consts::TAU * around_index as f64 / around as f64;
-            let arc = theta * radius;
-            let margin_gate = if axial_offset.abs() <= usable_length * 0.5 {
-                1.0
-            } else {
-                0.0
-            };
-            let groove = pattern_angles(params.pattern, params.angle_deg)
-                .into_iter()
-                .map(|angle| {
-                    groove_profile(
-                        arc - axial_offset * angle.tan(),
-                        params.pitch,
-                        params.groove_width,
-                    )
-                })
-                .fold(0.0_f64, f64::max)
-                * margin_gate;
-            let local_radius = radius - params.depth * groove;
-            let radial = x_axis * theta.cos() + z_axis * theta.sin();
-            positions.push(
-                (center + axis * axial_offset + radial * local_radius)
-                    .as_vec3()
-                    .to_array(),
+    // Fit an integral number of starts to the circumference. Each groove is
+    // swept through its unwrapped angle, including crossings of zero radians.
+    let starts = (circumference / params.pitch).round().max(1.0) as usize;
+    if params.groove_width >= 0.9 * circumference / starts as f64 {
+        return Err("Groove width is too large for the fitted cylindrical pitch".into());
+    }
+    let angular_step = (0.4 * params.depth / radius).sqrt().clamp(0.004, 0.08);
+    let across = ((params.groove_width / (radius * angular_step)).ceil() as usize)
+        .max(10)
+        .next_multiple_of(2);
+    let clearance = (radius * (1.0 - (angular_step * 0.5).cos()) + 0.002).min(radius * 0.25);
+    let bore_overlap = (2.0 * clearance).max(radius * 0.02);
+    let quad = |indices: &mut Vec<u32>, a, b, c, d| indices.extend_from_slice(&[a, b, c, a, c, d]);
+    let mut groups = Vec::new();
+    for angle in pattern_angles(params.pattern, params.angle_deg) {
+        let twist = angle.tan() / radius;
+        let along = ((2.0 * half_length * twist.abs() / angular_step).ceil() as usize).max(1);
+        if starts
+            .saturating_mul(along.saturating_add(1))
+            .saturating_mul(across + 1)
+            > 45_000
+        {
+            return Err(
+                "Cylindrical texture is too dense; increase the pitch or narrow the textured band"
+                    .into(),
             );
         }
-    }
-    let bottom_center = positions.len() as u32;
-    positions.push((center - axis * (length * 0.5)).as_vec3().to_array());
-    let top_center = positions.len() as u32;
-    positions.push((center + axis * (length * 0.5)).as_vec3().to_array());
-    let mut indices = Vec::with_capacity(along * around * 6 + around * 6);
-    for axial_index in 0..along {
-        for around_index in 0..around {
-            let next_around = (around_index + 1) % around;
-            let a = (axial_index * around + around_index) as u32;
-            let b = (axial_index * around + next_around) as u32;
-            let c = ((axial_index + 1) * around + next_around) as u32;
-            let d = ((axial_index + 1) * around + around_index) as u32;
-            indices.extend_from_slice(&[a, b, c, a, c, d]);
+        let mut positions = Vec::new();
+        let mut indices = Vec::new();
+        for groove in 0..starts {
+            let phase = std::f64::consts::TAU * groove as f64 / starts as f64;
+            let base = positions.len() as u32;
+            let row = ((across + 1) * 2) as u32;
+            for j in 0..=along {
+                let z = (2.0 * j as f64 / along as f64 - 1.0) * half_length;
+                for i in 0..=across {
+                    let offset = (i as f64 / across as f64 - 0.5) * params.groove_width;
+                    let theta = phase + z * twist + offset / radius;
+                    let direction = x * theta.cos() + y * theta.sin();
+                    let relief = groove_profile(offset, params.pitch, params.groove_width);
+                    let penetration = params.depth * relief - clearance * (1.0 - relief);
+                    let radii = if internal {
+                        [radius - bore_overlap, radius + penetration]
+                    } else {
+                        [radius - penetration, radius + 2.0 * clearance]
+                    };
+                    positions.extend(
+                        radii.map(|r| (center + axis * z + direction * r).as_vec3().to_array()),
+                    );
+                }
+            }
+            for j in 0..along {
+                for i in 0..across {
+                    let a = base + j as u32 * row + i as u32 * 2;
+                    let b = a + 2;
+                    let c = b + row;
+                    let d = a + row;
+                    quad(&mut indices, a + 1, b + 1, c + 1, d + 1);
+                    quad(&mut indices, a, d, c, b);
+                    if j == 0 {
+                        quad(&mut indices, a, b, b + 1, a + 1);
+                    }
+                    if j + 1 == along {
+                        quad(&mut indices, d, d + 1, c + 1, c);
+                    }
+                    if i == 0 {
+                        quad(&mut indices, a, a + 1, d + 1, d);
+                    }
+                    if i + 1 == across {
+                        quad(&mut indices, b, c, c + 1, b + 1);
+                    }
+                }
+            }
         }
+        groups.push(MeshData::new(positions, indices));
     }
-    let top_ring = (along * around) as u32;
-    for around_index in 0..around {
-        let next = ((around_index + 1) % around) as u32;
-        let current = around_index as u32;
-        indices.extend_from_slice(&[
-            bottom_center,
-            next,
-            current,
-            top_center,
-            top_ring + current,
-            top_ring + next,
-        ]);
-    }
-    let mut mesh = MeshData::new(positions, indices);
-    mesh.weld(1e-5);
-    Ok(mesh)
+    Ok(groups)
 }
 
 fn groove_profile(coordinate: f64, pitch: f64, width: f64) -> f64 {
@@ -392,13 +428,15 @@ mod tests {
             x_axis: [1.0, 0.0, 0.0],
             radius: 12.0,
             length: 30.0,
+            internal: false,
         };
         assert!(validate(&planar, &params).is_ok());
         assert!(validate(&cylinder, &params).is_ok());
         assert!(!planar_cutters(&planar, &params).unwrap()[0].is_empty());
-        assert!(!textured_cylinder_mesh(&cylinder, &params)
+        assert!(cylindrical_cutters(&cylinder, &params)
             .unwrap()
-            .is_empty());
+            .iter()
+            .all(|mesh| !mesh.is_empty()));
     }
 
     #[test]
@@ -453,6 +491,7 @@ mod tests {
             x_axis: [1.0, 0.0, 0.0],
             radius: 10.0,
             length: 20.0,
+            internal: false,
         };
         let params = SurfaceTextureParams {
             pattern: SurfaceTexturePattern::Diamond,
@@ -462,7 +501,62 @@ mod tests {
             angle_deg: 45.0,
             margin: 1.0,
         };
+        for cutter in cylindrical_cutters(&surface, &params).unwrap() {
+            assert_watertight(&cutter);
+        }
+        let original = kernel.tessellate(source).unwrap();
         let result = build_surface_texture_shape(&mut kernel, source, &surface, &params).unwrap();
-        assert_watertight(&kernel.tessellate(result).unwrap());
+        let mesh = kernel.tessellate(result).unwrap();
+        assert_watertight(&mesh);
+        assert_eq!(original.bounds(), mesh.bounds());
+        assert!(
+            crate::ui::mesh_surface_area_and_volume(&mesh).1
+                < crate::ui::mesh_surface_area_and_volume(&original).1
+        );
+    }
+
+    #[test]
+    fn cylindrical_bore_texture_cuts_the_inner_wall_and_retains_the_sleeve() {
+        use s33d_kernel::{DatumPlane, Region2D};
+        let mut kernel = TruckKernel::new();
+        let circle = |radius| {
+            (0..64).map(move |index| {
+                let angle = std::f64::consts::TAU * index as f64 / 64.0;
+                [radius * angle.cos(), radius * angle.sin()]
+            })
+        };
+        let sleeve = Region2D {
+            outer: circle(15.0).collect(),
+            holes: vec![circle(8.0).rev().collect()],
+        };
+        let source = kernel
+            .extrude_region(&sleeve, &DatumPlane::Top.def(), 14.0)
+            .unwrap();
+        let surface = SurfaceTextureSurface::Cylinder {
+            center: [0.0, 7.0, 0.0],
+            axis: [0.0, 1.0, 0.0],
+            x_axis: [1.0, 0.0, 0.0],
+            radius: 8.0,
+            length: 14.0,
+            internal: true,
+        };
+        let params = SurfaceTextureParams {
+            pattern: SurfaceTexturePattern::Straight,
+            pitch: 6.0,
+            groove_width: 1.2,
+            depth: 0.8,
+            angle_deg: 45.0,
+            margin: 1.0,
+        };
+        let result = build_surface_texture_shape(&mut kernel, source, &surface, &params).unwrap();
+        let original = kernel.tessellate(source).unwrap();
+        let mesh = kernel.tessellate(result).unwrap();
+        assert_watertight(&mesh);
+        assert_eq!(original.bounds(), mesh.bounds());
+        assert!(
+            crate::ui::mesh_surface_area_and_volume(&original).1
+                - crate::ui::mesh_surface_area_and_volume(&mesh).1
+                > 10.0
+        );
     }
 }

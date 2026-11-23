@@ -43,8 +43,9 @@
 - 左侧是建模工具栏：选择 Sketch、Draw 3D、Extrude、Boolean、Mirror 等命令。
 - 中央是 3D 工作区：查看模型、选择 edge / surface / object，并操作 Gizmo。
 - 右侧是 View、Properties、Beginner Guide 和 History。
-- Objects 浮动窗用于查看、选择、隐藏、改名、改色和删除对象。
+- Objects 浮动窗用于查看、选择、隐藏、改名、改色和删除对象。拖动标题栏可以移动浮窗，在列表内滚动可以查看更多对象。
 - 底部状态栏显示提示、当前 Unit、Step 和 Snap。
+- 主窗口标题栏和“帮助 > 关于 S33D”显示构建编号。Windows 安装包文件名也包含该编号。
 
 ## 2. 选择对象 / Selection
 
@@ -159,8 +160,9 @@
 - 进入 Chamfer/Fillet 后选择一条边或连续边链。
 - Chamfer 使用 Distance，Fillet 使用 Radius。
 - 凸斜边 Radius 是两面相切圆的半径，不是沿面退让距离；内角越尖需要的空间越大。已保存的结果不会因软件更新自动变化，应重新编辑特征并 Apply 重建。
-- Apply 生成当前预览；Done 提交并允许继续选择下一对象。
+- Apply 立即修改实体。Done 完成当前边并保留工具，可以继续选择下一条边。
 - Objects 中可重新选择特征并修改参数；删除中间特征会重建后续依赖。
+- 对直壁多边形孔可逐边选择并 Apply。同一孔口上连续的等宽倒角会在转角自动斜接。要重算旧工程中保存的等宽倒角链，可选中最后一个特征，按原距离再次 Apply。
 
 ## 15. Array、Copy、Paste 与 Delete
 
@@ -197,7 +199,7 @@
 - Plug-ins 可启用 Gear Generator、Tire Generator、Wheel Rim Generator 与 Surface Texture。
 - Tire Generator 按外径、轮辋直径、断面宽、胎纹深度和重复数生成 Highway Rib、Block、Chevron 或 All-Terrain 胎纹。
 - Wheel Rim Generator 生成 Five Spoke、Six Spoke、Split Five Spoke 或 Multi-Spoke 轮毂，可编辑轮心、中心孔和螺栓孔参数。
-- Surface Texture 需先选择平面或参数化圆柱侧面，可生成 Straight、左右 Diagonal 或 Diamond 滚花，并设置 Pitch、Groove Width、Depth、Angle 与 Margin。
+- Surface Texture 需先选择平面或完整圆柱壁（包括圆孔内壁），可生成 Straight、左右 Diagonal 或 Diamond 滚花，并设置 Pitch、Groove Width、Depth、Angle 与 Margin。柱面纹理的实际节距会调整，使纹槽在整圈均匀排布。
 - 生成对象保留参数；选中后重开插件即可保持 Object ID 更新。Surface Texture 会隐藏并保留源对象，形成非破坏依赖。
 
 ## 19. 设置与新手模式 / Settings and Beginner Mode
@@ -265,3 +267,6 @@ Exact offset/shell requires original STEP surfaces. Choose offset, hollow with r
 关闭 S33D 会结束已连接的 MCP 桥接。重新打开后，如果 Agent 没有自动重连，请重启 Agent。连接入口为“设置 > Agent 连接 > 启用本机控制”。桥接工具与连接步骤详见 [AgentControl.md](AgentControl.md)。
 
 当前 MCP 提供六个工具：`s33d_workflow`、`s33d_reference`、`s33d_render`、`s33d_describe`、`s33d_state` 和 `s33d_execute`。开始建模时先取工作流程与实时目录，再查询 `document.summary`；用原生模型图核对结果。安装程序提供连接模板，注册 Agent 仍需在本机明确操作。
+
+
+标题栏与 Help > 关于 S33D 提供构建编号；关于窗口显示构建时间（UTC）、安装渠道和“复制版本信息”，安装包文件名包含同一编号。

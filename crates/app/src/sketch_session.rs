@@ -488,19 +488,14 @@ impl SketchSession {
         best
     }
 
-    /// 当前草图可显示/可吸附的关键点。
-    pub fn key_points(&self) -> Vec<Point2> {
+    /// Marker positions for the sketch's own editable entities.
+    pub fn entity_marker_points(&self) -> Vec<Point2> {
         let mut points = Vec::new();
         for entity in &self.entities {
             for (point, _) in entity_key_points(entity) {
                 if !points.iter().any(|existing| dist(*existing, point) < 1e-8) {
                     points.push(point);
                 }
-            }
-        }
-        for &point in &self.external_key_points {
-            if !points.iter().any(|existing| dist(*existing, point) < 1e-8) {
-                points.push(point);
             }
         }
         points
@@ -3218,7 +3213,7 @@ mod tests {
                 c2: [10.0, 6.0],
             }],
         );
-        let points = s.key_points();
+        let points = s.entity_marker_points();
         assert!(points.contains(&[5.0, 3.0]));
         assert!(points.contains(&[5.0, 0.0]));
         assert!(points.contains(&[10.0, 3.0]));
@@ -4086,7 +4081,7 @@ mod tests {
     fn surface_reference_points_are_displayed_and_snappable() {
         let mut session = SketchSession::new(PlaneDef::from_normal([0.0, 0.0, 1.0]), vec![]);
         session.set_external_key_points(vec![[3.0, 4.0], [3.0, 4.0]]);
-        assert_eq!(session.key_points(), vec![[3.0, 4.0]]);
+        assert_eq!(session.external_key_points, vec![[3.0, 4.0]]);
         let snapped = session.snap([3.2, 4.1], true, false, 1.0, 1.0);
         assert_eq!(snapped, [3.0, 4.0]);
         assert_eq!(session.snap_kind, Some(SnapKind::Endpoint));

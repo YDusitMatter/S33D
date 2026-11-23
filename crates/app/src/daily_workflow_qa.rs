@@ -20,6 +20,462 @@ fn volume(app: &mut S33DApp, id: BodyId) -> f64 {
 }
 
 #[test]
+fn sketch_reference_lines_skip_split_triangle_seams() {
+    let mesh = MeshData::new(
+        vec![
+            [0., 0., 0.],
+            [0., 0., 1.],
+            [1., 0., 1.],
+            [0., 0., 0.],
+            [1., 0., 1.],
+            [1., 0., 0.],
+        ],
+        vec![0, 1, 2, 3, 4, 5],
+    );
+    let mut reference = SketchReferenceGeometry::new(mesh, 22.);
+    let eye = glam::Vec3::new(0.5, 10., 0.5);
+    let (visible, hidden) = reference.lines(eye);
+    assert_eq!(visible.len(), 8);
+    assert!(hidden.is_empty());
+    let visible_ptr = visible.as_ptr();
+    assert_eq!(reference.lines(eye).0.as_ptr(), visible_ptr);
+}
+
+#[test]
+#[ignore = "Run with S33D_PROJECT6 pointing to the user's regression project"]
+fn project6_surface_sketch_entry_exit() {
+    use glam::Vec3;
+    use std::time::Instant;
+    let timed = |label: &str, run: &mut dyn FnMut()| {
+        let start = Instant::now();
+        run();
+        eprintln!("{label}: {:.1} ms", start.elapsed().as_secs_f64() * 1000.);
+    };
+    let path = std::env::var_os("S33D_PROJECT6").expect("Set S33D_PROJECT6");
+    let input = std::fs::read_to_string(path).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = S33DApp::new(&eframe::CreationContext::_new_kittest(ctx));
+    app.load_s33d_project(&input).unwrap();
+    let original_bodies = app.doc.bodies.len();
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440., 900.));
+    app.viewport_rect = rect;
+    app.camera.eye = Vec3::new(-7.57, 160., 31.13);
+    app.camera.target = Vec3::new(-7.57, 20., 31.13);
+    app.camera.up = -Vec3::Z;
+    app.camera.ortho = true;
+    app.camera.ortho_half = 85.;
+    timed("First Idle scene (includes display weld)", &mut || {
+        app.refresh_scene()
+    });
+
+    for draw in [false, true] {
+        let mut face = None;
+        timed("Select forward planar face", &mut || {
+            face = app.pick_face(rect.center(), rect).map(|(face, _)| face)
+        });
+        let face = face.expect("pick Project 6 cap");
+        assert!(face.normal[1] > 0.99 && face.area_mm2 > 100.);
+        app.face_pick = Some(face.clone());
+        timed("Surface menu profile check", &mut || {
+            eprintln!("Bounded profile: {}", app.has_bounded_planar_selection());
+        });
+        timed("Sketch On", &mut || app.sketch_on_selected_profile());
+        assert_eq!(app.mode, Mode::Sketch);
+        assert_eq!(app.sketch_on_body, Some(face.body_id));
+        timed("First Sketch scene", &mut || app.refresh_scene());
+        let (line_vertices, marker_vertices) = {
+            let scene = app.scene.lock().unwrap();
+            (
+                scene
+                    .body_edge_lines
+                    .iter()
+                    .map(|group| group.positions.len())
+                    .sum::<usize>(),
+                scene.sketch_point_lines.positions.len(),
+            )
+        };
+        eprintln!("Sketch reference line vertices: {line_vertices}");
+        eprintln!("Sketch marker line vertices: {marker_vertices}");
+        assert!(line_vertices < 300_000);
+        assert!(marker_vertices > 0 && marker_vertices < 410_000);
+        assert!(!app.sketch.as_ref().unwrap().external_key_points.is_empty());
+        app.bump_scene();
+        timed("Next Sketch scene", &mut || app.refresh_scene());
+        if draw {
+            app.sketch
+                .as_mut()
+                .unwrap()
+                .entities
+                .push(SketchEntity::Circle { c: [0.; 2], r: 1. });
+        }
+        timed("Exit Sketch", &mut || app.exit_sketch());
+        assert_eq!(app.mode, Mode::Idle);
+        assert_eq!(app.doc.bodies.len(), original_bodies + usize::from(draw));
+        timed("Shaded scene after exit", &mut || app.refresh_scene());
+        timed("Face hover after exit", &mut || {
+            app.update_hover(rect.center(), rect)
+        });
+    }
+}
+
+#[test]
+fn polygon_hole_rims_join_across_side_counts_and_corner_angles() {
+    use glam::{DVec2, Vec3};
+    let regular = |count: usize, phase: f64, radius: f64| {
+        (0..count)
+            .map(|i| {
+                let angle = phase + std::f64::consts::TAU * i as f64 / count as f64;
+                [radius * angle.cos(), radius * angle.sin()]
+            })
+            .collect::<Vec<_>>()
+    };
+    let profiles = [
+        regular(3, 0.19, 30.),
+        regular(4, 0.43, 30.),
+        regular(5, 0., 30.),
+        regular(5, 0.23, 30.),
+        regular(7, 0.17, 30.),
+        regular(15, 0.37, 30.),
+        regular(37, 0.41, 30.),
+        vec![
+            [-25., -17.],
+            [16., -24.],
+            [29., 3.],
+            [11., 25.],
+            [-27., 16.],
+        ],
+        vec![[-30., -10.], [15., -6.], [45., 0.], [15., 6.], [-30., 10.]],
+        vec![
+            [-22., -20.],
+            [28., -18.],
+            [12., 1.],
+            [27., 25.],
+            [-19., 24.],
+        ],
+    ];
+    for (case, profile) in profiles.into_iter().enumerate() {
+        let ctx = egui::Context::default();
+        let n = profile.len();
+        let points = profile
+            .iter()
+            .copied()
+            .map(DVec2::from_array)
+            .collect::<Vec<_>>();
+        let mut perimeter = 0.0;
+        let mut corner_sum = 0.0;
+        for i in 0..n {
+            let incoming = points[i] - points[(i + n - 1) % n];
+            let outgoing = points[(i + 1) % n] - points[i];
+            perimeter += outgoing.length();
+            corner_sum += (incoming.perp_dot(outgoing).atan2(incoming.dot(outgoing)) / 2.0).tan();
+        }
+        let distance: f64 = 2.0;
+        // Integrate the area added by an offset w of the hole from w=0 to w=d.
+        let removed = perimeter * distance.powi(2) / 2.0 + corner_sum * distance.powi(3) / 3.0;
+        let mut app = S33DApp::new(&eframe::CreationContext::_new_kittest(ctx.clone()));
+        let region = Region2D {
+            outer: regular(96, 0.13, 65.),
+            holes: vec![profile.into_iter().rev().collect()],
+        };
+        let source = app
+            .kernel
+            .extrude_region(&region, &DatumPlane::Top.def(), 20.)
+            .unwrap();
+        let root = app.doc.alloc_id();
+        app.doc.add_body(Body {
+            id: root,
+            name: format!("Polygon hole {case}"),
+            kind: BodyKind::Solid,
+            feature: Feature::Imported {
+                path: String::new(),
+            },
+            shape: Some(source),
+            material: Material::default(),
+            visible: true,
+        });
+        let original_mesh = app.kernel.tessellate(source).unwrap();
+        let geometry = PickGeometry::new(original_mesh.clone());
+        let seed = geometry
+            .chains
+            .iter()
+            .flatten()
+            .find(|edge| edge.a[1] > 19.9 && edge.b[1] > 19.9 && edge.a[0].hypot(edge.a[2]) < 55.)
+            .unwrap();
+        let (rim, _) = find_polygon_chamfer_rim(&geometry, std::slice::from_ref(seed), distance)
+            .unwrap_or_else(|| panic!("case {case}, {n} sides: cannot identify the rim"));
+        assert_eq!(rim.len(), n);
+        app.camera.eye = Vec3::new(0., 150., 0.);
+        app.camera.target = Vec3::ZERO;
+        app.camera.up = -Vec3::Z;
+        app.camera.ortho = true;
+        app.camera.ortho_half = 75.;
+        app.chamfer_active = true;
+        app.chamfer_fillet = false;
+        app.chamfer_param = distance as f32;
+        pointer_frame(&ctx, &mut app, egui::Pos2::ZERO, None);
+        let rect = app.viewport_rect;
+        let project =
+            app.camera.proj_matrix(rect.width() / rect.height()) * app.camera.view_matrix();
+        let mut latest = root;
+        let mut recovered_end_cap = false;
+        let original_volume = volume(&mut app, root);
+        for (i, edge) in rim.iter().enumerate() {
+            let mid = (Vec3::from(edge.a) + Vec3::from(edge.b)) * 0.5;
+            let wall_normal = if edge.n1[1].abs() < 0.1 {
+                edge.n1
+            } else {
+                edge.n2
+            };
+            let ndc = project.project_point3(mid - Vec3::from(wall_normal) * 0.35);
+            let pos = egui::pos2(
+                rect.left() + (1. + ndc.x) * rect.width() / 2.,
+                rect.top() + (1. - ndc.y) * rect.height() / 2.,
+            );
+            pointer_frame(&ctx, &mut app, pos, Some(true));
+            pointer_frame(&ctx, &mut app, pos, Some(false));
+            let picked = app
+                .selected_edge
+                .as_ref()
+                .unwrap_or_else(|| panic!("case {case}: cannot pick side {i}"));
+            assert_eq!(picked.body_id, latest);
+            let sides = polygon_chamfer_rim_indices(&rim, &picked.segments).unwrap_or_else(|| {
+                panic!("case {case}: pick did not return the original rim at side {i}")
+            });
+            assert_eq!(sides, vec![i], "case {case}: each click selects one side");
+            if case == 2 && latest != root {
+                let shape = app.doc.body(latest).unwrap().shape.unwrap();
+                let geometry = app.picking_geometry(shape);
+                let (eye, direction) = app.ray_from_ndc([ndc.x, ndc.y]);
+                let (triangle, _) = ray_mesh_tri(eye, direction, &geometry.mesh).unwrap();
+                let (chain, _, _) =
+                    closest_edge_on_hit_face(&geometry, triangle, &project, rect, pos).unwrap();
+                let raw = &geometry.chains[chain];
+                if polygon_chamfer_rim_indices(&rim, raw).is_none() {
+                    assert_eq!(
+                        recover_polygon_chamfer_sides(&rim, raw, distance),
+                        Some(sides.clone())
+                    );
+                    recovered_end_cap = true;
+                }
+            }
+            app.apply_chamfer();
+            assert_ne!(
+                app.selected,
+                vec![latest],
+                "case {case} at side {i}: {:?}",
+                app.history
+            );
+            latest = app.selected[0];
+        }
+        if case == 2 {
+            assert!(
+                recovered_end_cap,
+                "five-sided hole must exercise a merged end cap"
+            );
+        }
+        let actual = original_volume - volume(&mut app, latest);
+        assert!(
+            (actual - removed).abs() < 0.03,
+            "case {case}: removed {actual} instead of {removed}"
+        );
+        let result = app.doc.body(latest).unwrap().shape.unwrap();
+        assert_eq!(
+            app.kernel.tessellate(result).unwrap().bounds(),
+            original_mesh.bounds()
+        );
+    }
+}
+
+#[test]
+fn chamfer_picks_the_complete_rim_of_a_sketch_circle() {
+    use glam::Vec3;
+    let ctx = egui::Context::default();
+    let mut app = S33DApp::new(&eframe::CreationContext::_new_kittest(ctx.clone()));
+    let plane = DatumPlane::Top.def();
+    let outer = SketchEntity::Circle { c: [0.; 2], r: 50. };
+    let hole = SketchEntity::Circle { c: [0.; 2], r: 22. };
+    let (inner_ring, _) = hole.to_chain();
+    let count = inner_ring.len();
+    let region = Region2D {
+        outer: outer.to_chain().0,
+        holes: vec![inner_ring.into_iter().rev().collect()],
+    };
+    let source = app.kernel.extrude_region(&region, &plane, 14.).unwrap();
+    let root = app.doc.alloc_id();
+    app.doc.add_body(Body {
+        id: root,
+        name: "Circular hole".into(),
+        kind: BodyKind::Solid,
+        feature: Feature::Extrude {
+            sketch: SketchFeature {
+                plane,
+                entities: vec![outer, hole],
+                vertex_locks: Default::default(),
+                world_xyz_coordinates: false,
+                on_body: None,
+            },
+            params: ExtrudeParams {
+                depth: 14.,
+                symmetric: false,
+                bevel: 0.,
+            },
+            source_sketch: None,
+            pocket_source_sketches: Vec::new(),
+            region_indices: Vec::new(),
+        },
+        shape: Some(source),
+        material: Material::default(),
+        visible: true,
+    });
+    app.chamfer_active = true;
+    app.camera.eye = Vec3::new(0., 150., 0.);
+    app.camera.target = Vec3::ZERO;
+    app.camera.up = -Vec3::Z;
+    app.camera.ortho = true;
+    app.camera.ortho_half = 60.;
+    pointer_frame(&ctx, &mut app, egui::Pos2::ZERO, None);
+    let rect = app.viewport_rect;
+    let pos = rect.center() + egui::vec2(22.3 * rect.height() / 120., 0.);
+    pointer_frame(&ctx, &mut app, pos, Some(true));
+    pointer_frame(&ctx, &mut app, pos, Some(false));
+    assert_eq!(app.selected_edge.as_ref().unwrap().segments.len(), count);
+    app.apply_chamfer();
+    assert_ne!(app.selected, vec![root]);
+}
+
+#[test]
+fn successive_hexagonal_hole_chamfers_share_the_six_miter_joints() {
+    use glam::Vec3;
+    let ctx = egui::Context::default();
+    let mut app = S33DApp::new(&eframe::CreationContext::_new_kittest(ctx.clone()));
+    let polygon = |count, radius| {
+        (0..count).map(move |i| {
+            let angle = std::f64::consts::TAU * f64::from(i) / f64::from(count) + 0.23;
+            [radius * angle.cos(), radius * angle.sin()]
+        })
+    };
+    let region = Region2D {
+        outer: polygon(96, 63.65).collect(),
+        holes: vec![polygon(6, 30.0).rev().collect()],
+    };
+    let source = app
+        .kernel
+        .extrude_region(&region, &DatumPlane::Top.def(), 20.0)
+        .unwrap();
+    let root = app.doc.alloc_id();
+    app.doc.add_body(Body {
+        id: root,
+        name: "Hexagonal hole".into(),
+        kind: BodyKind::Solid,
+        feature: Feature::Imported {
+            path: String::new(),
+        },
+        shape: Some(source),
+        material: Material::default(),
+        visible: true,
+    });
+    let original = app.kernel.tessellate(source).unwrap();
+    let geometry = PickGeometry::new(original.clone());
+    let seed = geometry
+        .chains
+        .iter()
+        .flatten()
+        .find(|edge| edge.a[1] > 19.9 && edge.b[1] > 19.9 && Vec3::from(edge.a).length() < 40.0)
+        .unwrap();
+    let rim = geometry.inner_rim(seed).unwrap();
+    assert_eq!(rim.len(), 6);
+    app.camera.eye = Vec3::new(0., 150., 0.);
+    app.camera.target = Vec3::ZERO;
+    app.camera.up = -Vec3::Z;
+    app.camera.ortho = true;
+    app.camera.ortho_half = 75.0;
+    app.chamfer_active = true;
+    app.chamfer_fillet = false;
+    app.chamfer_param = 2.;
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900., 900.));
+    app.viewport_rect = rect;
+    let project = app.camera.proj_matrix(1.0) * app.camera.view_matrix();
+    let mut latest = root;
+    let mut operations = Vec::new();
+    let mut prior_volume = volume(&mut app, root);
+    // Pick from the visible result. Alternate across the opening to leave
+    // disconnected partial runs before joining them and closing the last seam.
+    for i in [0, 1, 4, 3, 2, 5] {
+        let edge = &rim[i];
+        let middle = (Vec3::from(edge.a) + Vec3::from(edge.b)) * 0.5;
+        let toward_material = Vec3::new(middle.x, 0., middle.z).normalize();
+        let ndc = project.project_point3(middle + toward_material * 0.2);
+        let pos = egui::pos2((1. + ndc.x) * 450.0, (1. - ndc.y) * 450.0);
+        let picked = app
+            .pick_edge(pos, rect)
+            .unwrap_or_else(|| panic!("cannot pick exposed upper edge {i} after {operations:?}"));
+        assert_eq!(picked.body_id, latest);
+        assert_eq!(
+            polygon_chamfer_rim_indices(&rim, &picked.segments),
+            Some(vec![i])
+        );
+        app.selected = vec![picked.body_id];
+        app.selected_edge = Some(picked);
+        app.apply_chamfer();
+        assert_ne!(app.selected, vec![latest], "side {i}: {:?}", app.history);
+        latest = app.selected[0];
+        operations.push(latest);
+        let result_volume = volume(&mut app, latest);
+        assert!(result_volume < prior_volume - 45.0);
+        prior_volume = result_volume;
+    }
+    let (whole, _) = app
+        .evaluate_chamfer_feature(source, &rim, Some(2.), None)
+        .unwrap();
+    let whole_volume = app.shape_measurements(whole).unwrap().3;
+    assert!((prior_volume - whole_volume).abs() < 0.02);
+    let shape = app.doc.body(latest).unwrap().shape.unwrap();
+    let mesh = app.kernel.tessellate(shape).unwrap();
+    assert_eq!(mesh.bounds(), original.bounds());
+    for t in mesh.indices.chunks_exact(3) {
+        let [a, b, c] = [0, 1, 2].map(|i| Vec3::from(mesh.positions[t[i] as usize]));
+        let normal = (b - a).cross(c - a).normalize_or_zero();
+        assert!(
+            normal.y.abs() < 0.005
+                || (normal.y.abs() - 1.0).abs() < 0.005
+                || (normal.y - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01,
+            "unexpected corner face normal {normal:?}"
+        );
+    }
+
+    // Recreate the independent cutters used by older projects, including
+    // shortened edge selectors left by an adjacent operation.
+    let mut legacy_base = source;
+    for (&id, i) in operations.iter().zip([0, 1, 4, 3, 2, 5]) {
+        let mut edge = rim[i].clone();
+        let a = Vec3::from(edge.a);
+        let b = Vec3::from(edge.b);
+        edge.a = a.lerp(b, 0.02).to_array();
+        edge.b = a.lerp(b, 0.98).to_array();
+        let (shape, _) = app
+            .evaluate_chamfer_feature(legacy_base, std::slice::from_ref(&edge), Some(2.), None)
+            .unwrap();
+        let body = app.doc.body_mut(id).unwrap();
+        body.shape = Some(shape);
+        if let Feature::Chamfer { edges, .. } = &mut body.feature {
+            *edges = model_chamfer_segments(&[edge]);
+        }
+        legacy_base = shape;
+    }
+    assert!((volume(&mut app, latest) - whole_volume).abs() > 0.1);
+    let file = app.project_to_s33d().unwrap();
+    app.load_s33d_project(&file).unwrap();
+    let last = app.doc.body(latest).unwrap().clone();
+    app.selected = vec![latest];
+    app.restore_chamfer_from_feature(&last);
+    app.apply_chamfer();
+    assert_eq!(app.selected, vec![latest]);
+    assert!((volume(&mut app, latest) - whole_volume).abs() < 0.02);
+    app.delete_chamfer_operation(operations[2]).unwrap();
+    assert!(volume(&mut app, latest) > whole_volume + 45.0);
+}
+
+#[test]
 fn apply_updates_one_location_then_accumulates_the_next_without_done() {
     for fillet in [false, true] {
         let ctx = egui::Context::default();
