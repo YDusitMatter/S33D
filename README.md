@@ -1,5 +1,9 @@
 # S33D
 
+AI Agents can create and edit 3D models in S33D from text descriptions and dimensions, while vision-capable Agents can also model from reference photos and iteratively refine results using model views.
+
+AI Agent 可根据文字描述和尺寸要求操控 S33D 创建、修改 3D 模型，支持视觉的 Agent 还可参考照片并结合模型视图迭代完善。
+
 S33D is a local, offline-first 3D CAD application written in Rust. It is currently a developer preview aimed at personal design, 3D-printing, and small-workshop workflows.
 
 S33D 是一款使用 Rust 开发、以本地离线工作为主的 3D CAD 应用。目前项目处于开发者预览阶段，主要面向个人设计、3D 打印和小型制造工作流。
