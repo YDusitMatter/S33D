@@ -9,8 +9,43 @@ concurrency:
   group: occt-source-relink-audit-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  windows-rebuild:
+  source-download:
     if: github.event.repository.private == true
+    runs-on: windows-2022
+    timeout-minutes: 10
+    # GitHub draft releases require push access. This job never builds dependencies.
+    permissions:
+      contents: write
+    env:
+      AUDIT_ROOT: ${{ github.workspace }}\source-fetch
+    steps:
+      - name: Checkout only audit scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          sparse-checkout: ci
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Download private draft source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ASSET_ID: '785194550'
+          EXPECTED_SOURCE_SHA256: 'cb4ab4e8bb4ac60adcd12128a406dc7224fcbbe17b624e57b634457440675c1f'
+        run: python ci/fetch_corresponding_source.py
+      - name: Transfer checksum-verified source to read-only build job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: corresponding-source-kit
+          path: ${{ github.workspace }}/source-fetch/corresponding-source.zip
+          retention-days: 1
+          compression-level: 0
+  windows-rebuild:
+    needs: source-download
+    if: github.event.repository.private == true
+    permissions:
+      contents: read
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -25,12 +60,11 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.12"
-      - name: Download checksum-pinned corresponding source
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_ASSET_ID: '785194550'
-          EXPECTED_SOURCE_SHA256: 'cb4ab4e8bb4ac60adcd12128a406dc7224fcbbe17b624e57b634457440675c1f'
-        run: python ci/fetch_corresponding_source.py
+      - name: Receive source kit without draft-write credentials
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: corresponding-source-kit
+          path: ${{ github.workspace }}/occt-source-audit
       - name: Install original Rust toolchain
         run: |
           rustup toolchain install 1.97.1 --profile minimal
