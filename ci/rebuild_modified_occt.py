@@ -9,16 +9,30 @@ root=Path(os.environ['AUDIT_ROOT']).resolve();evidence=root/'evidence';evidence.
 kit=root/'kit';kit.mkdir();target=root/'build';assert not target.exists()
 marker='S33D-OCCT-RELINK-AUDIT-20261123-2'
 report={'passed':False,'source_commit':'1ed6e375970fb0e6af62e90d16192d837350e986','marker':marker,'fresh_native_target':True}
+
+def checkpoint():
+    (evidence/'relink-result.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
 def sha(path):
     with path.open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
 def safe(name):
     p=PurePosixPath(name);assert not p.is_absolute() and '..' not in p.parts and ':' not in name and '\\' not in name
     return p
 def run(name,args,env):
+    report['active_phase']=name
+    checkpoint()
     print('Starting '+name,flush=True)
+    started=time.monotonic()
     with (evidence/(name+'.log')).open('wb') as log:
-        result=subprocess.run(args,stdout=log,stderr=subprocess.STDOUT,env=env)
-    assert result.returncode==0,name+' failed; inspect the evidence log'
+        process=subprocess.Popen(args,stdout=log,stderr=subprocess.STDOUT,env=env)
+        while True:
+            try:
+                result=process.wait(timeout=30)
+                break
+            except subprocess.TimeoutExpired:
+                print(name+': still running, '+str(round(time.monotonic()-started))+' seconds; log '+str(log.tell())+' bytes',flush=True)
+    report.setdefault('phase_seconds',{})[name]=round(time.monotonic()-started)
+    checkpoint()
+    assert result==0,name+' failed; inspect the evidence log'
     print('Completed '+name,flush=True)
 try:
     archive=root/'corresponding-source.zip'
@@ -76,9 +90,26 @@ try:
     import re
     flags=re.search(r'^CMAKE_CXX_FLAGS_RELEASE:[^=]+=(.*)$',cache,re.M).group(1)
     assert '/O2' in flags and '/Ob2' in flags and 'NDEBUG' in flags
-    run('kernel-geometry-tests',base+['test','--release','--manifest-path',manifest_path,'--config',patch,'-p','s33d-kernel','-j','2','--','--test-threads=2'],env)
+    report.update(replacement_marker_in_library_and_s33d=True,release_optimization_verified=True,app_sha256=sha(app),agent_sha256=sha(agent),tkernel_sha256=sha(lib),native_library_count=len(list((native/'lib').glob('*.lib'))),supplied_source_entries_verified=len(expected))
+    checkpoint()
+    # Resolve tests with the same workspace feature graph as the application.
+    # Running only `cargo test -p s33d-kernel` can select different host dependency
+    # features and unnecessarily rebuild the native stack a second time.
+    run('compile-workspace-tests',base+['test','--release','--manifest-path',manifest_path,'--config',patch,'--workspace','--no-run','--message-format=json','-j','2'],env)
+    executables=set()
+    for line in (evidence/'compile-workspace-tests.log').read_text(encoding='utf-8',errors='replace').splitlines():
+        try:message=json.loads(line)
+        except ValueError:continue
+        if message.get('reason')=='compiler-artifact' and message.get('target',{}).get('name')=='s33d_kernel' and message.get('profile',{}).get('test') and message.get('executable'):
+            executables.add(Path(message['executable']).resolve())
+    assert len(executables)==1,'Expected one workspace-built kernel test executable'
+    test_executable=executables.pop()
+    assert test_executable.is_relative_to(target.resolve()) and marker.encode() in test_executable.read_bytes()
+    report['replacement_marker_in_kernel_tests']=True
+    checkpoint()
+    run('kernel-geometry-tests',[str(test_executable),'--test-threads=2'],env)
     version=subprocess.check_output([str(agent),'--version'],env=env,text=True).strip();assert version=='s33d-agent 0.1.0-alpha.1'
     report.update(passed=True,replacement_marker_in_library_and_s33d=True,release_optimization_verified=True,kernel_tests_passed=True,agent_version=version,app_sha256=sha(app),agent_sha256=sha(agent),tkernel_sha256=sha(lib),native_library_count=len(list((native/'lib').glob('*.lib'))),supplied_source_entries_verified=len(expected))
 finally:
-    (evidence/'relink-result.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+    checkpoint()
 print(json.dumps({'passed':True,'replacement_library_linked':True,'kernel_tests_passed':True}),flush=True)
