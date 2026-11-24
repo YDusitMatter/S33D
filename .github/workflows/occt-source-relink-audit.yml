@@ -1,0 +1,47 @@
+name: OCCT corresponding-source relink audit
+on:
+  push:
+    branches: [codex/occt-source-relink-audit]
+    paths: ['.github/workflows/occt-source-relink-audit.yml', 'ci/**']
+permissions:
+  contents: read
+concurrency:
+  group: occt-source-relink-audit-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  windows-rebuild:
+    if: github.event.repository.private == true
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      AUDIT_ROOT: ${{ runner.temp }}\occt-source-audit
+    steps:
+      - name: Checkout only audit scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          sparse-checkout: ci
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Download checksum-pinned corresponding source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_ASSET_ID: '785194550'
+          EXPECTED_SOURCE_SHA256: 'cb4ab4e8bb4ac60adcd12128a406dc7224fcbbe17b624e57b634457440675c1f'
+        run: python ci/fetch_corresponding_source.py
+      - name: Install original Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot install the pinned Rust toolchain' }
+      - name: Build and test against modified OCCT
+        run: python ci/rebuild_modified_occt.py
+      - name: Keep audit evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: occt-relink-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/occt-source-audit/evidence/
+          if-no-files-found: warn
+          retention-days: 7
